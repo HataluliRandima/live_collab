@@ -14,24 +14,31 @@ Built entirely on Phoenix's native primitives—`Phoenix.Presence`, `Phoenix.Pub
 
 LiveCollab enforces a strict separation between two categories of collaborative events:
 
-| Category | Transport / Engine | Typical Events | LiveView Diff Impact |
+| Category | Transport / Engine | Typical Events | LiveView Lifecycle & Diff Impact |
 | :--- | :--- | :--- | :--- |
-| **Durable Collaborative State** (Path 1) | `Phoenix.Presence` (CRDT) | User joins/leaves, active presence, field-level locks, element/row activity | Low frequency; safely updates LiveView assigns |
-| **High-Frequency Ephemeral Telemetry** (Path 2) | `Phoenix.PubSub` + Client JS | Mouse coordinates, collaborative cursors, scroll/viewport telemetry, selection marquees | **Zero LiveView render cycles or diff storms; rendered directly in JS** |
+| **Durable Collaborative State** (Path 1) | `Phoenix.Presence` (CRDT) | User joins/leaves, active presence, field-level locks, element/row activity | Low frequency; safely updates LiveView assigns and renders reactive components |
+| **High-Frequency Ephemeral Telemetry** (Path 2) | `Phoenix.PubSub` + Client JS + `RateLimiter` | Mouse coordinates, collaborative cursors, scroll/viewport telemetry, selection marquees | **Zero assigns diffing or template re-renders; rendered directly in client JS; protected at socket boundary by token-bucket rate limiter** |
 
 ---
 
 ## Features
 
-### Version 3.0 (Viewport Following & Multiplayer Selection Containers)
+### Version 0.4.0 (Security Hardened & Cluster Resilient)
+- **Token Bucket Telemetry Rate Limiter (`LiveCollab.RateLimiter`)**: Purely functional in-memory token bucket directly in socket assigns ($O(1)$ monotonic arithmetic, zero GenServer/ETS overhead) that drops telemetry floods at the socket boundary before cluster PubSub saturation can occur.
+- **Multi-Node Cluster Clock-Skew Mitigation**: Replaces naive millisecond comparison with windowed bucketing in `LiveCollab.Field.resolve_conflict/2` (`clock_skew_tolerance_ms: 500`), guaranteeing identical deterministic tie-breaking across all nodes regardless of NTP drift or message arrival order.
+- **Client ID Injection Defense**: Completely ignores untrusted wire `params["client_id"]`, strictly enforcing server-authenticated `sock.assigns[:collab_client_id]`.
+- **Spotlight Authorization Guards**: Prevents unprivileged attendees (`role: "viewer"`, `collab_can_present?: false`) from hijacking viewports or disrupting ongoing presentations.
+- **Selection Marquee Bounding**: Sanitizes and truncates collaborative selection arrays to at most 100 items and 255 bytes per ID, neutralizing memory exhaustion attacks.
+- **Lock Seniority Preservation**: Re-focusing an already held field in `Phoenix.Presence` preserves the original `acquired_at` timestamp rather than resetting lock seniority.
+
+### Version 0.3.0 (Viewport Following & Multiplayer Selection Containers)
 - **Viewport & Scroll Following**: Presenters can lead followers through documents, canvases, or dashboards with smooth, programmatic scroll synchronization.
 - **Normalized Scroll Coordinates `[0.0, 1.0]`**: Eliminates coordinate distortion across differing display dimensions, aspect ratios, and responsive text layouts.
 - **Infinite Loop Feedback Suppression**: Programmatic follower scrolling suppresses local scroll event broadcasts, preventing cascading feedback loops.
 - **Follower Manual Breakout**: If a follower manually scrolls or wheels, follow mode gracefully disengages without fighting the user.
 - **Multiplayer Selection Containers (`<LiveCollab.Components.selection_layer />`)**: Real-time bounding boxes and marquee selections rendered in each collaborator's deterministic color with a floating username badge.
-- **Zero Assigns Diffing**: All scroll and selection broadcasts travel over PubSub directly to client hooks without mutating LiveView socket assigns or invoking template diffs.
 
-### Version 2.0 (High-Performance Collaborative Cursors)
+### Version 0.2.0 (High-Performance Collaborative Cursors)
 - **Zero Assigns Diffing**: High-frequency cursor messages bypass LiveView's assign diffing engine entirely via direct `push_event/3` dispatch. Zero template re-renders and zero Morphdom DOM overhead.
 - **Normalized Container Coordinates `[0.0, 1.0]`**: Cursor coordinates are transmitted relative to target containers, guaranteeing precise visual alignment across differing monitor sizes, responsive layouts, and zoom levels.
 - **Client-Side Throttling & Distance Deadband**: Limits transmission to 30ms (~33 fps) and skips broadcasts when mouse movement is below threshold, keeping network traffic minimal.
@@ -39,13 +46,7 @@ LiveCollab enforces a strict separation between two categories of collaborative 
 - **Crisp SVG Pointers & Name Pills**: Renders Figma-style SVG cursors colored with each user's deterministic palette color and displaying their name tag.
 - **Inactivity Timeout & Leave Cleanup**: Cursors automatically fade out after 4 seconds of inactivity and clear immediately when the pointer leaves the container.
 
-### Version 1.1 (Element & Table-Row Activity Indicators)
-- **Shared Multi-User Presence**: Multiple collaborators can simultaneously view or select the same table row, card, or document section.
-- **Row Activity Indicators (`<LiveCollab.Components.row_indicator />`)**: Displays compact stacked avatars on table rows showing who is currently viewing, selecting, or editing cells in that row.
-- **Anti-Diff-Storming Hover Intent**: Debounced hover intent in client hooks (`LiveCollabElement`) ensures moving the mouse across 100 table rows causes zero Presence diff storms.
-- **Dynamic CSS Variable Theming**: `collab_row_attrs/4` injects `--collab-element-color` for custom border or background highlighting.
-
-### Version 1.0 (Presence & Field-Level Collaboration)
+### Version 0.1.0 (Presence & Field-Level Collaboration)
 - **Collaborative Presence Tracking**: Clean, single-line API (`LiveCollab.track/3`) for tracking users viewing the same resource.
 - **Multi-Tab Isolation**: Transparently handles multiple tabs from the same user without identity or lock collisions via isolated client UUIDs.
 - **Avatar Stack Component (`<LiveCollab.Components.avatar_stack />`)**: Accessible, customizable avatar stack with deterministic colors, initial fallbacks, and overflow counters (`+3`).
@@ -66,7 +67,7 @@ Add `live_collab` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:live_collab, "~> 0.3.0"}
+    {:live_collab, "~> 0.4.0"}
   ]
 end
 ```
@@ -88,7 +89,10 @@ config :live_collab,
   presence: MyAppWeb.Presence,
   pubsub: MyApp.PubSub,
   topic_prefix: "live_collab",
-  max_field_id_length: 255
+  max_field_id_length: 255,
+  telemetry_rate_per_sec: 50,
+  telemetry_burst_limit: 60,
+  clock_skew_tolerance_ms: 500
 ```
 
 ---
@@ -293,20 +297,42 @@ end
 
 ---
 
+### 8. Spotlight & Presentation Permissions
+
+By default, any tracked user can lead a presentation. In environments with role-based access control, restrict viewer or observer attendees:
+
+```elixir
+# Option A: Assign permission flag on socket
+socket = assign(socket, :collab_can_present?, false)
+
+# Option B: Pass role in user map
+LiveCollab.track(socket, "doc:123", %{id: user.id, name: user.name, role: "viewer"})
+```
+
+If an unauthorized attendee fires `"live_collab:spotlight_lead"`, the server rejects the request, pushes `"live_collab:spotlight_unauthorized"` back to the client, and drops the broadcast. Furthermore, only the active leader or an authorized presenter/admin can emit `"live_collab:spotlight_stop"` to terminate an ongoing presentation.
+
+---
+
 ## Adversarial Design & Failure Mitigations
 
-1. **Path 2 Zero-Diffing Boundary**:
-   High-frequency telemetry (cursors, viewports, selections) travels strictly over `Phoenix.PubSub` directly to client JS hooks via `push_event/3`. `socket.assigns` is **never** mutated, preventing template re-render storms.
-2. **Infinite Scroll Feedback Defense**:
+1. **Path 2 Zero-Diffing Boundary & Mailbox Protection**:
+   High-frequency telemetry (cursors, viewports, selections) travels strictly over `Phoenix.PubSub` directly to client JS hooks via `push_event/3`. `socket.assigns` is **never** mutated during telemetry, eliminating HEEx template re-render storms and DOM reconciliation.
+2. **Token Bucket Rate Limiting (`LiveCollab.RateLimiter`)**:
+   Purely functional in-memory token buckets in socket assigns ($O(1)$ monotonic arithmetic) protect the LiveView mailbox and cluster PubSub against flood attacks from malicious or unthrottled clients. Telemetry exceeding configured rate limits is dropped at the socket boundary.
+3. **Multi-Node Cluster Clock-Skew Hardening**:
+   Replaces fragile raw millisecond ordering with windowed bucketing (`clock_skew_tolerance_ms: 500`). Competing focus claims arriving within the concurrency window break ties deterministically on `{bucket, client_id, user_id}`, rendering tie-breaking immune to NTP drift between cluster nodes.
+4. **Untrusted Client ID Parameter Injection Immunity**:
+   Wire-level `params["client_id"]` payloads are completely ignored across all event handlers. The server strictly uses `sock.assigns[:collab_client_id]`, preventing identity spoofing, lock theft, or tie-break rigging.
+5. **Presence Untrack Key Parity & No Zombie Locks**:
+   `Presence.untrack` is guaranteed to target the tracked `user_key` rather than the tab `client_id`, cleanly purging presence state upon departure. Process monitors purge locks immediately if a tab or node crashes.
+6. **Lock Seniority Preservation**:
+   Re-focusing an existing field preserves the original `acquired_at` timestamp in `Phoenix.Presence`, preventing lock seniority flapping during form re-renders.
+7. **Infinite Scroll Feedback Defense**:
    When programmatic scrolling is applied to follow a leader, an internal guard suppresses local scroll broadcasts, eliminating infinite feedback ping-pong loops.
-3. **Deterministic CRDT Tie-Breaking**:
-   If Alice and Bob focus a field simultaneously, both nodes resolve the claim deterministically on `{acquired_at, client_id}`. The identical winner is elected on every node. The loser receives `live_collab:lock_lost` and transitions to readonly.
-4. **Process-Monitored Lifecycle**:
-   Erlang monitors track the LiveView PID. When a tab crashes, browser closes, or device disconnects, field locks, row activity, and presence are instantaneously purged by `Phoenix.Tracker`. Zero orphan locks or stale state.
-5. **Multi-Tab Isolation**:
+8. **Multi-Tab Isolation**:
    Browser tabs generate isolated `client_id`s in `sessionStorage`. If the same user has two tabs open, Tab 2 is locked out if Tab 1 holds the field, preventing self-overwrites.
-6. **Malicious Input Defense**:
-   All field, element, coordinate, scroll, and selection parameters are strictly validated and bounded (preventing NaN, infinite coordinates, XSS, and payload bombing).
+9. **Malicious Input Defense & Bounded Payloads**:
+   All field, element, coordinate, scroll, and selection parameters are strictly validated and bounded (preventing NaN, infinite coordinates, XSS, and payload bombing with max 100 selection items and 255 bytes per ID).
 
 ---
 

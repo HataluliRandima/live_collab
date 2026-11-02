@@ -1,10 +1,14 @@
 {
   "name": "live_collab",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "description": "Client-side hooks and utilities for LiveCollab Phoenix LiveView library",
   "main": "js/live_collab/index.js",
   "module": "js/live_collab/index.js",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HataluliRandima/live_collab.git"
+  },
   "scripts": {
     "build": "echo 'Pure ES module, no build step required'"
   },
@@ -13,6 +17,8 @@
     "liveview",
     "collaboration",
     "multiplayer",
-    "presence"
+    "presence",
+    "cursors",
+    "viewport"
   ]
 }
