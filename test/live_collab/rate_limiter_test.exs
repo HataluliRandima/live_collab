@@ -73,3 +73,4 @@ defmodule LiveCollab.RateLimiterTest do
     end
   end
 end
+
