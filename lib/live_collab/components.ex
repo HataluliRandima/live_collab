@@ -204,7 +204,6 @@ defmodule LiveCollab.Components do
 
   def row_indicator(assigns) do
     users = Element.active_users(assigns.activities, assigns.element)
-    # Filter out current client if desired, or highlight others
     other_users = Enum.filter(users, &(&1.client_id != assigns.current_client_id))
     has_editing = Enum.any?(other_users, &(&1.type == :editing))
 
@@ -356,6 +355,55 @@ defmodule LiveCollab.Components do
       </div>
     <% end %>
     """
+  end
+
+  @doc """
+  Renders a high-performance collaborative cursor container layer.
+  Attaches `phx-hook="LiveCollabCursor"` and prepares the hardware-accelerated SVG overlay.
+
+  ## Examples
+
+      <.cursor_layer container_id="board" class="w-full h-[600px] border rounded">
+        <div>Your collaborative board content</div>
+      </.cursor_layer>
+  """
+  attr :container_id, :string, default: "default", doc: "Identifier for container-relative coordinate mapping"
+  attr :throttle, :integer, default: 30, doc: "Client throttle in milliseconds (~33 fps)"
+  attr :deadband, :float, default: 0.0015, doc: "Normalized distance threshold to avoid jitter broadcasts"
+  attr :class, :string, default: nil, doc: "CSS classes on the outer container"
+  slot :inner_block, required: false
+
+  def cursor_layer(assigns) do
+    ~H"""
+    <div
+      class={["live-collab-cursor-container relative", @class]}
+      {collab_cursor_attrs(@container_id, throttle: @throttle, deadband: @deadband)}
+    >
+      <%= render_slot(@inner_block) %>
+    </div>
+    """
+  end
+
+  @doc """
+  Generates HTML tag attributes to attach the `LiveCollabCursor` hook to any
+  existing container element (e.g. document body, SVG canvas, artboard).
+
+  ## Options
+
+  - `throttle` - Milliseconds between client cursor broadcasts (default `30`).
+  - `deadband` - Minimum normalized coordinate delta to broadcast (default `0.0015`).
+  """
+  @spec collab_cursor_attrs(container_id :: String.t(), opts :: keyword()) :: list()
+  def collab_cursor_attrs(container_id \\ "default", opts \\ []) do
+    throttle = Keyword.get(opts, :throttle, 30)
+    deadband = Keyword.get(opts, :deadband, 0.0015)
+
+    [
+      "phx-hook": "LiveCollabCursor",
+      "data-collab-container": container_id,
+      "data-collab-throttle": to_string(throttle),
+      "data-collab-deadband": to_string(deadband)
+    ]
   end
 
   @doc """

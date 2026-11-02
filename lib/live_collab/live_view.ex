@@ -25,6 +25,7 @@ defmodule LiveCollab.LiveView do
   import Phoenix.LiveView
 
   alias LiveCollab.Config
+  alias LiveCollab.Cursor
   alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.Presence
@@ -33,7 +34,7 @@ defmodule LiveCollab.LiveView do
   Tracks the collaborative session, subscribes to PubSub presence notifications,
   populates initial assigns (`collab_users`, `collab_locks`, `collab_activities`,
   `collab_topic`, `collab_client_id`), and attaches lifecycle hooks to handle
-  field focus/blur, element activity, and presence diffs.
+  field focus/blur, element activity, high-frequency cursor telemetry, and presence diffs.
   """
   @spec track(
           socket :: Phoenix.LiveView.Socket.t(),
@@ -45,6 +46,7 @@ defmodule LiveCollab.LiveView do
     config = Config.get(opts)
     presence_mod = config.presence || raise_missing_presence!()
     topic = Config.topic(config, resource)
+    pubsub_server = config.pubsub || default_pubsub_server(presence_mod)
 
     # Each browser tab or client instance generates or is assigned a unique client_id
     client_id = Keyword.get(opts, :client_id, generate_client_id())
@@ -52,8 +54,7 @@ defmodule LiveCollab.LiveView do
     # Only track if socket is connected to avoid tracking static HTTP pre-renders
     socket =
       if connected?(socket) do
-        # Subscribe to topic for presence_diff notifications
-        pubsub_server = config.pubsub || default_pubsub_server(presence_mod)
+        # Subscribe to topic for presence_diff and cursor notifications
         Phoenix.PubSub.subscribe(pubsub_server, topic)
 
         # Track this process in Phoenix.Presence
@@ -77,6 +78,7 @@ defmodule LiveCollab.LiveView do
 
     socket
     |> assign(:collab_topic, topic)
+    |> assign(:collab_pubsub, pubsub_server)
     |> assign(:collab_client_id, client_id)
     |> assign(:collab_users, users)
     |> assign(:collab_locks, locks)
@@ -95,7 +97,7 @@ defmodule LiveCollab.LiveView do
     presence_mod = config.presence || raise_missing_presence!()
 
     if connected?(socket) and is_binary(topic) do
-      pubsub_server = config.pubsub || default_pubsub_server(presence_mod)
+      pubsub_server = socket.assigns[:collab_pubsub] || config.pubsub || default_pubsub_server(presence_mod)
       Phoenix.PubSub.unsubscribe(pubsub_server, topic)
       presence_mod.untrack(socket, topic, to_string(socket.assigns[:collab_client_id]))
     end
@@ -225,6 +227,33 @@ defmodule LiveCollab.LiveView do
 
         {:halt, assign(sock, :collab_active_element, nil)}
 
+      # High-Frequency Ephemeral Cursor Telemetry (Path 2: Zero Assigns Diffing)
+      "live_collab:cursor_move", %{"x" => x, "y" => y} = params, sock ->
+        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+
+        case Cursor.validate_coordinates(x, y) do
+          {:ok, nx, ny} ->
+            topic = sock.assigns.collab_topic
+            pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+            container_id = params["container_id"]
+            payload = Cursor.build_payload(client_id, user, nx, ny, container_id)
+
+            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
+            {:halt, sock}
+
+          {:error, _reason} ->
+            {:halt, sock}
+        end
+
+      "live_collab:cursor_left", params, sock ->
+        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+        topic = sock.assigns.collab_topic
+        pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+        container_id = params["container_id"]
+
+        Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_left, topic, %{client_id: client_id, container_id: container_id}})
+        {:halt, sock}
+
       _other_event, _params, sock ->
         {:cont, sock}
     end)
@@ -234,6 +263,21 @@ defmodule LiveCollab.LiveView do
     attach_hook(socket, :live_collab_info, :handle_info, fn
       %Phoenix.Socket.Broadcast{event: "presence_diff", topic: ^topic}, sock ->
         {:halt, handle_presence_sync(sock, presence_mod, topic)}
+
+      # High-Frequency Ephemeral Cursor Telemetry (Path 2: Zero Assigns Diffing)
+      {:collab_cursor_moved, ^topic, payload}, sock ->
+        if payload[:client_id] != sock.assigns[:collab_client_id] do
+          {:halt, push_event(sock, "live_collab:cursor_moved", payload)}
+        else
+          {:halt, sock}
+        end
+
+      {:collab_cursor_left, ^topic, payload}, sock ->
+        if payload[:client_id] != sock.assigns[:collab_client_id] do
+          {:halt, push_event(sock, "live_collab:cursor_left", payload)}
+        else
+          {:halt, sock}
+        end
 
       _other_msg, sock ->
         {:cont, sock}
@@ -258,7 +302,7 @@ defmodule LiveCollab.LiveView do
     end
   end
 
-  defp raise_missing_presence! do
+  defp raise_missing_presence!() do
     raise ArgumentError, """
     LiveCollab requires a Phoenix.Presence module to be configured.
 
@@ -354,6 +398,37 @@ defmodule LiveCollab.LiveView do
         {:noreply, assign(socket, :collab_active_element, nil)}
       end
 
+      def handle_event("live_collab:cursor_move", %{"x" => x, "y" => y} = params, socket) do
+        client_id = params["client_id"] || socket.assigns[:collab_client_id]
+        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+        user = socket.assigns[:current_user] || %{}
+
+        case LiveCollab.Cursor.validate_coordinates(x, y) do
+          {:ok, nx, ny} ->
+            topic = socket.assigns.collab_topic
+            pubsub = socket.assigns[:collab_pubsub] || config.pubsub || LiveCollab.LiveView.default_pubsub_server(config.presence)
+            container_id = params["container_id"]
+            payload = LiveCollab.Cursor.build_payload(client_id, user, nx, ny, container_id)
+
+            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
+            {:noreply, socket}
+
+          {:error, _} ->
+            {:noreply, socket}
+        end
+      end
+
+      def handle_event("live_collab:cursor_left", params, socket) do
+        client_id = params["client_id"] || socket.assigns[:collab_client_id]
+        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+        topic = socket.assigns.collab_topic
+        pubsub = socket.assigns[:collab_pubsub] || config.pubsub || LiveCollab.LiveView.default_pubsub_server(config.presence)
+        container_id = params["container_id"]
+
+        Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_left, topic, %{client_id: client_id, container_id: container_id}})
+        {:noreply, socket}
+      end
+
       def handle_info(
             %Phoenix.Socket.Broadcast{
               event: "presence_diff",
@@ -364,6 +439,24 @@ defmodule LiveCollab.LiveView do
           when topic == socket.assigns.collab_topic do
         config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
         {:noreply, LiveCollab.LiveView.handle_presence_sync(socket, config.presence, topic)}
+      end
+
+      def handle_info({:collab_cursor_moved, topic, payload}, socket)
+          when topic == socket.assigns.collab_topic do
+        if payload[:client_id] != socket.assigns[:collab_client_id] do
+          {:noreply, push_event(socket, "live_collab:cursor_moved", payload)}
+        else
+          {:noreply, socket}
+        end
+      end
+
+      def handle_info({:collab_cursor_left, topic, payload}, socket)
+          when topic == socket.assigns.collab_topic do
+        if payload[:client_id] != socket.assigns[:collab_client_id] do
+          {:noreply, push_event(socket, "live_collab:cursor_left", payload)}
+        else
+          {:noreply, socket}
+        end
       end
     end
   end

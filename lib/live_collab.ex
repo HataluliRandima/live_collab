@@ -207,6 +207,17 @@ defmodule LiveCollab do
   defdelegate validate_element_id(element_id, max_length \\ 255), to: Element
 
   @doc """
+  Validates incoming cursor coordinates sent from a client.
+  """
+  defdelegate validate_cursor_coordinates(x, y), to: LiveCollab.Cursor, as: :validate_coordinates
+
+  @doc """
+  Generates HTML tag attributes to attach the `LiveCollabCursor` hook to any container.
+  """
+  defdelegate collab_cursor_attrs(container_id \\ "default", opts \\ []),
+    to: LiveCollab.Components
+
+  @doc """
   Validates that a field is not locked during changeset processing (`phx-change` or `phx-submit`).
   """
   defdelegate validate_not_locked(changeset, field_name, locks, client_id, opts \\ []),
