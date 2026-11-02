@@ -7,6 +7,7 @@ defmodule LiveCollab.Components do
   """
 
   use Phoenix.Component
+  alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.Presence
 
@@ -184,6 +185,180 @@ defmodule LiveCollab.Components do
   end
 
   @doc """
+  Renders an activity indicator for a table row showing active collaborators.
+
+  ## Examples
+
+      <.row_indicator
+        element={"row:#{row.id}"}
+        activities={@collab_activities}
+        current_client_id={@collab_client_id}
+      />
+  """
+  attr :element, :string, required: true, doc: "The element/row identifier, e.g. row:42"
+  attr :activities, :map, required: true, doc: "The @collab_activities map"
+  attr :current_client_id, :string, default: nil, doc: "The current tab client ID"
+  attr :max, :integer, default: 3, doc: "Maximum visible avatars"
+  attr :size, :string, default: "xs", values: ["xs", "sm", "md"]
+  attr :class, :string, default: nil
+
+  def row_indicator(assigns) do
+    users = Element.active_users(assigns.activities, assigns.element)
+    # Filter out current client if desired, or highlight others
+    other_users = Enum.filter(users, &(&1.client_id != assigns.current_client_id))
+    has_editing = Enum.any?(other_users, &(&1.type == :editing))
+
+    assigns =
+      assigns
+      |> assign(:users, other_users)
+      |> assign(:has_editing, has_editing)
+      |> assign(:total, length(other_users))
+      |> assign(:visible, Enum.take(other_users, assigns.max))
+      |> assign(:overflow, length(other_users) - assigns.max)
+
+    ~H"""
+    <%= if @total > 0 do %>
+      <div
+        role="status"
+        aria-live="polite"
+        aria-label={"#{collaborator_summary(@users)} on this row"}
+        class={["live-collab-row-indicator inline-flex items-center gap-1 overflow-visible", @class]}
+      >
+        <%!-- Stacked mini avatars --%>
+        <div class="inline-flex items-center -space-x-1.5">
+          <%= for user <- @visible do %>
+            <div
+              class="relative"
+              title={"#{user.user_name} (#{user.type})"}
+              aria-label={"#{user.user_name} (#{user.type})"}
+            >
+              <%= if user.user_avatar do %>
+                <img
+                  src={user.user_avatar}
+                  alt={user.user_name}
+                  class={["rounded-full ring-1 ring-white object-cover", avatar_size_class(@size)]}
+                />
+              <% else %>
+                <div
+                  class={[
+                    "rounded-full ring-1 ring-white text-white font-medium flex items-center justify-center select-none",
+                    avatar_size_class(@size)
+                  ]}
+                  style={"background-color: #{user.user_color};"}
+                >
+                  <%= Presence.initials(user.user_name) %>
+                </div>
+              <% end %>
+
+              <%= if user.type == :editing do %>
+                <span
+                  class="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-400 ring-1 ring-white animate-pulse"
+                  title="Editing"
+                ></span>
+              <% end %>
+            </div>
+          <% end %>
+
+          <%= if @overflow > 0 do %>
+            <div
+              class={[
+                "rounded-full ring-1 ring-white bg-gray-200 text-gray-700 font-semibold flex items-center justify-center",
+                avatar_size_class(@size)
+              ]}
+              title={"#{@overflow} more viewing"}
+            >
+              +<%= @overflow %>
+            </div>
+          <% end %>
+        </div>
+
+        <%!-- Status text badge if someone is actively editing --%>
+        <%= if @has_editing do %>
+          <span class="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-800 animate-fadeIn">
+            editing
+          </span>
+        <% end %>
+      </div>
+    <% end %>
+    """
+  end
+
+  @doc """
+  Renders a customizable activity component for generic elements (cards, sections, blocks).
+  """
+  attr :element, :string, required: true
+  attr :activities, :map, required: true
+  attr :current_client_id, :string, default: nil
+  attr :max, :integer, default: 4
+  attr :size, :string, default: "sm"
+  attr :class, :string, default: nil
+
+  slot :user_badge
+  slot :overflow_indicator
+
+  def element_activity(assigns) do
+    users = Element.active_users(assigns.activities, assigns.element)
+    other_users = Enum.filter(users, &(&1.client_id != assigns.current_client_id))
+
+    assigns =
+      assigns
+      |> assign(:users, other_users)
+      |> assign(:total, length(other_users))
+      |> assign(:visible, Enum.take(other_users, assigns.max))
+      |> assign(:overflow, length(other_users) - assigns.max)
+
+    ~H"""
+    <%= if @total > 0 do %>
+      <div
+        role="group"
+        aria-label={"Collaborators on #{@element}"}
+        class={["live-collab-element-activity inline-flex items-center -space-x-1", @class]}
+      >
+        <%= for user <- @visible do %>
+          <%= if @user_badge != [] do %>
+            <%= render_slot(@user_badge, user) %>
+          <% else %>
+            <div
+              class="relative"
+              title={"#{user.user_name} (#{user.type})"}
+              aria-label={"#{user.user_name} (#{user.type})"}
+            >
+              <div
+                class={[
+                  "rounded-full ring-1 ring-white text-white font-medium flex items-center justify-center select-none",
+                  avatar_size_class(@size)
+                ]}
+                style={"background-color: #{user.user_color};"}
+              >
+                <%= Presence.initials(user.user_name) %>
+              </div>
+              <%= if user.type == :editing do %>
+                <span class="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-amber-400 ring-1 ring-white"></span>
+              <% end %>
+            </div>
+          <% end %>
+        <% end %>
+
+        <%= if @overflow > 0 do %>
+          <%= if @overflow_indicator != [] do %>
+            <%= render_slot(@overflow_indicator, @overflow) %>
+          <% else %>
+            <div
+              class={[
+                "rounded-full ring-1 ring-white bg-gray-200 text-gray-700 font-semibold flex items-center justify-center",
+                avatar_size_class(@size)
+              ]}
+            >
+              +<%= @overflow %>
+            </div>
+          <% end %>
+        <% end %>
+      </div>
+    <% end %>
+    """
+  end
+
+  @doc """
   Generates HTML tag attributes for an input to wire up LiveCollab hooks,
   readonly states, and accessibility properties.
 
@@ -222,6 +397,77 @@ defmodule LiveCollab.Components do
       end
 
     attrs
+  end
+
+  @doc """
+  Generates HTML tag attributes for a table row (`<tr>`) or clickable element container
+  to attach `LiveCollabElement` tracking hooks, accessibility labels, and CSS styling variables.
+
+  ## Options
+
+  - `hover_intent` - Debounce in milliseconds for hover intent (e.g. `300`). Omit or `nil` for click/focus only.
+  - `type` - Activity type when triggered (`:viewing` or `:selected`). Default `:viewing`.
+  """
+  @spec collab_row_attrs(
+          element_id :: String.t(),
+          activities :: Element.activities_map(),
+          client_id :: String.t() | nil,
+          opts :: keyword()
+        ) :: list()
+  def collab_row_attrs(element_id, activities, client_id, opts \\ []) do
+    active_by_other = Element.active_by_other?(activities, element_id, client_id)
+    users = Element.active_users(activities, element_id)
+    other_users = Enum.filter(users, &(&1.client_id != client_id))
+    primary_user = List.first(other_users)
+    hover_intent = Keyword.get(opts, :hover_intent)
+    activity_type = Keyword.get(opts, :type, :viewing)
+
+    attrs = [
+      "phx-hook": "LiveCollabElement",
+      "data-collab-element": element_id,
+      "data-collab-type": to_string(activity_type),
+      "data-collab-active": to_string(active_by_other)
+    ]
+
+    attrs =
+      if hover_intent && hover_intent > 0 do
+        attrs ++ ["data-collab-hover-intent": to_string(hover_intent)]
+      else
+        attrs
+      end
+
+    attrs =
+      if active_by_other and primary_user do
+        summary = collaborator_summary(other_users)
+
+        attrs ++
+          [
+            style: "--collab-element-color: #{primary_user.user_color};",
+            "aria-description": "#{summary} on this item"
+          ]
+      else
+        attrs
+      end
+
+    attrs
+  end
+
+  @doc """
+  Convenience alias for `collab_row_attrs/4` on generic elements (cards, containers, sections).
+  """
+  defdelegate collab_element_attrs(element_id, activities, client_id, opts \\ []),
+    to: __MODULE__,
+    as: :collab_row_attrs
+
+  defp collaborator_summary([]), do: ""
+  defp collaborator_summary([single]), do: "#{single.user_name} is viewing"
+
+  defp collaborator_summary([first, second]) do
+    "#{first.user_name} and #{second.user_name} are viewing"
+  end
+
+  defp collaborator_summary([first | rest]) do
+    "#{first.user_name} and #{length(rest)} others are viewing"
   end
 
   defp avatar_size_class("xs"), do: "w-5 h-5 text-[10px]"

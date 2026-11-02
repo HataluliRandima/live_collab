@@ -7,6 +7,7 @@ defmodule LiveCollab.Presence do
   - Deterministic user avatar color and initials generation
   - Presence metadata normalization
   - Atomic field lock updates
+  - Shared element and row activity updates
   """
 
   alias LiveCollab.Config
@@ -36,6 +37,7 @@ defmodule LiveCollab.Presence do
           initials: String.t(),
           tabs_count: non_neg_integer(),
           active_fields: [String.t()],
+          active_elements: [String.t()],
           metas: [map()]
         }
 
@@ -64,7 +66,10 @@ defmodule LiveCollab.Presence do
         user_avatar: avatar_url,
         user_color: color,
         field: nil,
-        acquired_at: 0
+        acquired_at: 0,
+        element: nil,
+        element_type: :viewing,
+        element_acquired_at: 0
       }
       |> Map.merge(extra_meta)
 
@@ -109,9 +114,57 @@ defmodule LiveCollab.Presence do
   end
 
   @doc """
+  Updates the element or table-row currently active for this client.
+  """
+  @spec update_element(
+          presence_module :: module(),
+          pid_or_socket :: pid() | Phoenix.LiveView.Socket.t(),
+          topic :: String.t(),
+          user_id :: term(),
+          element_id :: String.t() | nil,
+          activity_type :: atom(),
+          client_id :: String.t()
+        ) :: {:ok, binary()} | {:error, term()}
+  def update_element(
+        presence_module,
+        pid_or_socket,
+        topic,
+        user_id,
+        element_id,
+        activity_type,
+        client_id
+      ) do
+    now = if element_id, do: System.system_time(:millisecond), else: 0
+
+    presence_module.update(pid_or_socket, topic, to_string(user_id), fn existing_meta ->
+      Map.merge(existing_meta, %{
+        element: element_id,
+        element_type: activity_type,
+        element_acquired_at: now,
+        client_id: client_id
+      })
+    end)
+  end
+
+  @doc """
+  Clears any active element activity for the given client.
+  """
+  @spec clear_element(
+          presence_module :: module(),
+          pid_or_socket :: pid() | Phoenix.LiveView.Socket.t(),
+          topic :: String.t(),
+          user_id :: term(),
+          client_id :: String.t()
+        ) :: {:ok, binary()} | {:error, term()}
+  def clear_element(presence_module, pid_or_socket, topic, user_id, client_id) do
+    update_element(presence_module, pid_or_socket, topic, user_id, nil, :viewing, client_id)
+  end
+
+  @doc """
   Transforms raw `Phoenix.Presence.list/1` output into a list of structured `user_collab` maps.
 
-  Consolidates multiple tabs for the same user while preserving tabs count and active field list.
+  Consolidates multiple tabs for the same user while preserving tabs count, active fields,
+  and active element locations.
   """
   @spec extract_users(map()) :: [user_collab()]
   def extract_users(presence_entries) when is_map(presence_entries) do
@@ -127,6 +180,12 @@ defmodule LiveCollab.Presence do
         |> Enum.filter(&(is_binary(&1) and &1 != ""))
         |> Enum.uniq()
 
+      active_elements =
+        metas
+        |> Enum.map(&Map.get(&1, :element))
+        |> Enum.filter(&(is_binary(&1) and &1 != ""))
+        |> Enum.uniq()
+
       %{
         id: user_id,
         name: name,
@@ -135,6 +194,7 @@ defmodule LiveCollab.Presence do
         initials: initials(name),
         tabs_count: length(metas),
         active_fields: active_fields,
+        active_elements: active_elements,
         metas: metas
       }
     end

@@ -6,7 +6,7 @@ defmodule LiveCollab do
 
   LiveCollab brings real-time collaborative features into Phoenix LiveView
   using Phoenix's built-in infrastructure:
-  - `Phoenix.Presence` for durable collaborative state (presence, avatar stacks, field locking)
+  - `Phoenix.Presence` for durable collaborative state (presence, avatar stacks, field locking, row/element activity)
   - `Phoenix.PubSub` for ephemeral, high-frequency telemetry (cursors, viewports)
   - Zero external brokers, Redis, or SaaS dependencies.
 
@@ -42,6 +42,20 @@ defmodule LiveCollab do
       <%!-- Collaborative Avatar Stack --%>
       <LiveCollab.Components.avatar_stack users={@collab_users} />
 
+      <%!-- Table Row Activity Indicator --%>
+      <table>
+        <tr :for={row <- @rows} {LiveCollab.Components.collab_row_attrs("row:\#{row.id}", @collab_activities, @collab_client_id)}>
+          <td>
+            <LiveCollab.Components.row_indicator
+              element={"row:\#{row.id}"}
+              activities={@collab_activities}
+              current_client_id={@collab_client_id}
+            />
+            <%= row.title %>
+          </td>
+        </tr>
+      </table>
+
       <%!-- Collaborative Input with Editing Lock & Indicator --%>
       <div class="relative">
         <label>Customer Name</label>
@@ -69,13 +83,15 @@ defmodule LiveCollab do
   """
 
   alias LiveCollab.Config
+  alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.LiveView, as: LV
   alias LiveCollab.Presence
 
   @doc """
   Tracks collaborative presence on a resource for the given socket and user.
-  Automatically attaches LiveView lifecycle hooks for handling field focus/blur and presence diffs.
+  Automatically attaches LiveView lifecycle hooks for handling field focus/blur,
+  element activity, and presence diffs.
   """
   defdelegate track(socket, resource, user, opts \\ []), to: LV
 
@@ -131,6 +147,46 @@ defmodule LiveCollab do
   end
 
   @doc """
+  Returns all collaborators active on a given element or table row.
+  Accepts either a LiveView socket (with `@collab_activities` assigned) or directly an activities map.
+  """
+  @spec active_users(Phoenix.LiveView.Socket.t() | Element.activities_map(), String.t()) :: [
+          Element.element_activity()
+        ]
+  def active_users(
+        %Phoenix.LiveView.Socket{assigns: %{collab_activities: activities}},
+        element_id
+      ) do
+    Element.active_users(activities, element_id)
+  end
+
+  def active_users(activities, element_id) when is_map(activities) do
+    Element.active_users(activities, element_id)
+  end
+
+  @doc """
+  Checks if any other collaborator is active on the element or row.
+  """
+  @spec active_by_other?(
+          Phoenix.LiveView.Socket.t() | Element.activities_map(),
+          String.t(),
+          String.t() | nil
+        ) :: boolean()
+  def active_by_other?(
+        %Phoenix.LiveView.Socket{
+          assigns: %{collab_activities: activities, collab_client_id: client_id}
+        },
+        element_id,
+        _explicit_client_id
+      ) do
+    Element.active_by_other?(activities, element_id, client_id)
+  end
+
+  def active_by_other?(activities, element_id, client_id) when is_map(activities) do
+    Element.active_by_other?(activities, element_id, client_id)
+  end
+
+  @doc """
   Generates a deterministic color string for a given user identifier.
   """
   defdelegate user_color(identifier), to: Presence, as: :deterministic_color
@@ -144,6 +200,11 @@ defmodule LiveCollab do
   Validates a field identifier sent from an untrusted client.
   """
   defdelegate validate_field_id(field_id, max_length \\ 255), to: Field
+
+  @doc """
+  Validates an element identifier sent from an untrusted client.
+  """
+  defdelegate validate_element_id(element_id, max_length \\ 255), to: Element
 
   @doc """
   Validates that a field is not locked during changeset processing (`phx-change` or `phx-submit`).

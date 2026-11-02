@@ -62,4 +62,44 @@ defmodule LiveCollab.ComponentsTest do
       refute Keyword.has_key?(attrs, :readonly)
     end
   end
+
+  describe "collab_row_attrs/4" do
+    test "generates default element hook attributes when inactive" do
+      activities = %{}
+      attrs = Components.collab_row_attrs("row:10", activities, "client_me")
+
+      assert Keyword.get(attrs, :"phx-hook") == "LiveCollabElement"
+      assert Keyword.get(attrs, :"data-collab-element") == "row:10"
+      assert Keyword.get(attrs, :"data-collab-type") == "viewing"
+      assert Keyword.get(attrs, :"data-collab-active") == "false"
+      refute Keyword.has_key?(attrs, :style)
+    end
+
+    test "includes hover_intent when configured" do
+      activities = %{}
+      attrs = Components.collab_row_attrs("row:10", activities, "client_me", hover_intent: 300)
+
+      assert Keyword.get(attrs, :"data-collab-hover-intent") == "300"
+    end
+
+    test "generates active styles and aria descriptions when active by another collaborator" do
+      activities = %{
+        "row:10" => [
+          %{
+            client_id: "client_other",
+            user_name: "Sarah",
+            user_color: "#DC2626",
+            type: :viewing,
+            acquired_at: 100
+          }
+        ]
+      }
+
+      attrs = Components.collab_row_attrs("row:10", activities, "client_me")
+
+      assert Keyword.get(attrs, :"data-collab-active") == "true"
+      assert Keyword.get(attrs, :style) == "--collab-element-color: #DC2626;"
+      assert Keyword.get(attrs, :"aria-description") == "Sarah is viewing on this item"
+    end
+  end
 end
