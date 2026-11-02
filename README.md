@@ -17,11 +17,19 @@ LiveCollab enforces a strict separation between two categories of collaborative 
 | Category | Transport / Engine | Typical Events | LiveView Diff Impact |
 | :--- | :--- | :--- | :--- |
 | **Durable Collaborative State** (Path 1) | `Phoenix.Presence` (CRDT) | User joins/leaves, active presence, field-level locks, element/row activity | Low frequency; safely updates LiveView assigns |
-| **High-Frequency Ephemeral Telemetry** (Path 2) | `Phoenix.PubSub` + Client JS | Mouse coordinates, collaborative cursors, scroll/viewport telemetry | **Zero LiveView render cycles or diff storms; rendered directly in JS** |
+| **High-Frequency Ephemeral Telemetry** (Path 2) | `Phoenix.PubSub` + Client JS | Mouse coordinates, collaborative cursors, scroll/viewport telemetry, selection marquees | **Zero LiveView render cycles or diff storms; rendered directly in JS** |
 
 ---
 
 ## Features
+
+### Version 3.0 (Viewport Following & Multiplayer Selection Containers)
+- **Viewport & Scroll Following**: Presenters can lead followers through documents, canvases, or dashboards with smooth, programmatic scroll synchronization.
+- **Normalized Scroll Coordinates `[0.0, 1.0]`**: Eliminates coordinate distortion across differing display dimensions, aspect ratios, and responsive text layouts.
+- **Infinite Loop Feedback Suppression**: Programmatic follower scrolling suppresses local scroll event broadcasts, preventing cascading feedback loops.
+- **Follower Manual Breakout**: If a follower manually scrolls or wheels, follow mode gracefully disengages without fighting the user.
+- **Multiplayer Selection Containers (`<LiveCollab.Components.selection_layer />`)**: Real-time bounding boxes and marquee selections rendered in each collaborator's deterministic color with a floating username badge.
+- **Zero Assigns Diffing**: All scroll and selection broadcasts travel over PubSub directly to client hooks without mutating LiveView socket assigns or invoking template diffs.
 
 ### Version 2.0 (High-Performance Collaborative Cursors)
 - **Zero Assigns Diffing**: High-frequency cursor messages bypass LiveView's assign diffing engine entirely via direct `push_event/3` dispatch. Zero template re-renders and zero Morphdom DOM overhead.
@@ -58,7 +66,7 @@ Add `live_collab` to your list of dependencies in `mix.exs`:
 ```elixir
 def deps do
   [
-    {:live_collab, "~> 0.2.0"}
+    {:live_collab, "~> 0.3.0"}
   ]
 end
 ```
@@ -106,12 +114,63 @@ liveSocket.connect()
 
 ## Usage Guide
 
-### 1. Collaborative Cursors (Zero Diff Overhead)
+### 1. Viewport & Scroll Following (Presentation Mode)
 
-Add multiplayer cursors to a canvas, whiteboard, or any container using `<.cursor_layer>`:
+Wrap long documents or dashboards with `<.viewport_container>` and display a `<.follow_pill>`:
 
 ```heex
-<%!-- Container with collaborative cursors --%>
+<%!-- Follow pill showing the presenter with a toggle button --%>
+<%= if @presenter do %>
+  <LiveCollab.Components.follow_pill
+    leader_name={@presenter.name}
+    leader_client_id={@presenter.client_id}
+    leader_color={@presenter.color}
+    is_following={@is_following}
+  />
+<% end %>
+
+<%!-- Synchronized scroll viewport container --%>
+<LiveCollab.Components.viewport_container
+  container_id="doc_reader"
+  presenter={@is_presenter}
+  following={if @is_following, do: @presenter.client_id, else: nil}
+  class="overflow-y-auto h-[600px] border rounded-lg p-6 bg-white"
+>
+  <div class="prose max-w-none">
+    <h1>Collaborative Document</h1>
+    <p>Scroll down to see followers match your position smoothly...</p>
+    <div style="height: 2000px;"></div>
+  </div>
+</LiveCollab.Components.viewport_container>
+```
+
+> [!TIP]
+> If a follower manually scrolls with their mouse wheel, `LiveCollabViewport` automatically disengages follow mode without fighting the user or echoing scroll events back to the presenter.
+
+---
+
+### 2. Multiplayer Selection Containers
+
+Display real-time bounding boxes when collaborators select items or drag marquee rects:
+
+```heex
+<LiveCollab.Components.selection_layer
+  container_id="design_board"
+  class="w-full h-[500px] border rounded-lg bg-gray-50"
+>
+  <div class="p-6 grid grid-cols-3 gap-4">
+    <div class="p-4 bg-white shadow rounded">Card 1</div>
+    <div class="p-4 bg-white shadow rounded">Card 2</div>
+    <div class="p-4 bg-white shadow rounded">Card 3</div>
+  </div>
+</LiveCollab.Components.selection_layer>
+```
+
+---
+
+### 3. Collaborative Cursors (Zero Diff Overhead)
+
+```heex
 <LiveCollab.Components.cursor_layer
   container_id="project_canvas"
   class="w-full h-[600px] border border-gray-200 rounded-lg shadow-sm bg-white overflow-hidden"
@@ -123,20 +182,9 @@ Add multiplayer cursors to a canvas, whiteboard, or any container using `<.curso
 </LiveCollab.Components.cursor_layer>
 ```
 
-Or attach the hook attributes to any existing element:
-
-```heex
-<main {LiveCollab.Components.collab_cursor_attrs("main_viewport", throttle: 30)}>
-  <%!-- Your page content --%>
-</main>
-```
-
-> [!NOTE]
-> High-frequency cursor movements are broadcast directly over `Phoenix.PubSub` and relayed via `push_event/3`. LiveView's `render/1` is **never** invoked and `socket.assigns` is **never** touched during cursor movement, preserving server performance and zeroing DOM recalculations.
-
 ---
 
-### 2. Track Collaborative Presence in your LiveView
+### 4. Collaborative Presence & Avatar Stack
 
 ```elixir
 defmodule MyAppWeb.OrderLive.Edit do
@@ -157,9 +205,7 @@ defmodule MyAppWeb.OrderLive.Edit do
 end
 ```
 
----
-
-### 3. Render the Avatar Stack
+In your HEEx template:
 
 ```heex
 <LiveCollab.Components.avatar_stack
@@ -171,7 +217,7 @@ end
 
 ---
 
-### 4. Table-Row Activity Indicators
+### 5. Table-Row Activity Indicators
 
 ```heex
 <table class="min-w-full divide-y divide-gray-200">
@@ -197,7 +243,7 @@ end
 
 ---
 
-### 5. Collaborative Form Inputs & Advisory Locks
+### 6. Collaborative Form Inputs & Advisory Locks
 
 ```heex
 <div class="space-y-1">
@@ -222,7 +268,7 @@ end
 
 ---
 
-### 6. Server-Side Changeset Enforcement (Security)
+### 7. Server-Side Changeset Enforcement (Security)
 
 Prevent unauthorized submissions by checking locks inside `phx-change` or `phx-submit`:
 
@@ -250,24 +296,17 @@ end
 ## Adversarial Design & Failure Mitigations
 
 1. **Path 2 Zero-Diffing Boundary**:
-   Cursor movements fire at 30–40 Hz per active user. Instead of triggering LiveView assigns changes and invoking template diffs, cursor coordinates travel purely over `Phoenix.PubSub` and are dispatched directly to the browser via `push_event/3`.
-2. **Deterministic CRDT Tie-Breaking**:
+   High-frequency telemetry (cursors, viewports, selections) travels strictly over `Phoenix.PubSub` directly to client JS hooks via `push_event/3`. `socket.assigns` is **never** mutated, preventing template re-render storms.
+2. **Infinite Scroll Feedback Defense**:
+   When programmatic scrolling is applied to follow a leader, an internal guard suppresses local scroll broadcasts, eliminating infinite feedback ping-pong loops.
+3. **Deterministic CRDT Tie-Breaking**:
    If Alice and Bob focus a field simultaneously, both nodes resolve the claim deterministically on `{acquired_at, client_id}`. The identical winner is elected on every node. The loser receives `live_collab:lock_lost` and transitions to readonly.
-3. **Process-Monitored Lifecycle**:
+4. **Process-Monitored Lifecycle**:
    Erlang monitors track the LiveView PID. When a tab crashes, browser closes, or device disconnects, field locks, row activity, and presence are instantaneously purged by `Phoenix.Tracker`. Zero orphan locks or stale state.
-4. **Multi-Tab Isolation**:
+5. **Multi-Tab Isolation**:
    Browser tabs generate isolated `client_id`s in `sessionStorage`. If the same user has two tabs open, Tab 2 is locked out if Tab 1 holds the field, preventing self-overwrites.
-5. **Malicious Input Defense**:
-   All field, element, and coordinate parameters are strictly validated and bounded (preventing NaN, infinite coordinates, XSS, and payload bombing).
-
----
-
-## Roadmap
-
-- **V1.0 (Complete)**: Presence tracking, accessible avatar stack, field-level collaboration & advisory locks, server-side validation.
-- **V1.1 (Complete)**: Element & table-row activity indicators (`<LiveCollab.Components.row_indicator />`, anti-diff hover intent).
-- **V2.0 (Complete)**: High-performance collaborative cursors via client-side SVG rendering & PubSub broadcast (zero LiveView assigns diffing).
-- **V3.0**: Viewport & scroll following, multiplayer selection containers.
+6. **Malicious Input Defense**:
+   All field, element, coordinate, scroll, and selection parameters are strictly validated and bounded (preventing NaN, infinite coordinates, XSS, and payload bombing).
 
 ---
 

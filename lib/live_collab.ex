@@ -218,6 +218,32 @@ defmodule LiveCollab do
     to: LiveCollab.Components
 
   @doc """
+  Validates incoming scroll and viewport coordinates sent from a client.
+  """
+  defdelegate validate_viewport_coordinates(scroll_x, scroll_y, zoom \\ 1.0),
+    to: LiveCollab.Viewport,
+    as: :validate_viewport
+
+  @doc """
+  Validates incoming multiplayer selection bounding box coordinates.
+  """
+  defdelegate validate_selection_bounds(x, y, w, h),
+    to: LiveCollab.Viewport,
+    as: :validate_selection
+
+  @doc """
+  Generates HTML tag attributes to attach the `LiveCollabViewport` hook to a container.
+  """
+  defdelegate collab_viewport_attrs(container_id \\ "default", opts \\ []),
+    to: LiveCollab.Components
+
+  @doc """
+  Generates HTML tag attributes to attach the `LiveCollabSelection` hook to a container.
+  """
+  defdelegate collab_selection_attrs(container_id \\ "default", opts \\ []),
+    to: LiveCollab.Components
+
+  @doc """
   Validates that a field is not locked during changeset processing (`phx-change` or `phx-submit`).
   """
   defdelegate validate_not_locked(changeset, field_name, locks, client_id, opts \\ []),
