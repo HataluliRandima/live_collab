@@ -520,4 +520,121 @@ defmodule LiveCollab.AdversarialTest do
              )
     end
   end
+
+  describe "Adversarial: Telemetry Flood Rate Limiting (Token Bucket Defense)" do
+    test "drops flood events when malicious client exceeds telemetry rate limits" do
+      # Limiter configured with burst of 10 and steady-state 50/sec
+      limiter = LiveCollab.RateLimiter.new(rate: 50, burst: 10, now_ms: 1000)
+
+      # Simulate an adversarial client flooding 50 cursor events in 1 millisecond
+      results =
+        Enum.reduce(1..50, {[], limiter}, fn _i, {acc, cur_limiter} ->
+          case LiveCollab.RateLimiter.check(cur_limiter, 1, 1000) do
+            {:allow, next_limiter} -> {[:allowed | acc], next_limiter}
+            {:deny, next_limiter} -> {[:denied | acc], next_limiter}
+          end
+        end)
+
+      {outcomes, final_limiter} = results
+
+      allowed_count = Enum.count(outcomes, &(&1 == :allowed))
+      denied_count = Enum.count(outcomes, &(&1 == :denied))
+
+      # Only 10 burst events are permitted; the remaining 40 flood events are dropped
+      assert allowed_count == 10
+      assert denied_count == 40
+      assert_in_delta final_limiter.tokens, 0.0, 0.001
+    end
+  end
+
+  describe "Adversarial: Multi-Node Cluster Clock Skew & Seniority Hardening" do
+    test "3-node cluster with 150ms clock skew converges to identical winner" do
+      base_time = 1_700_000_000_000
+
+      # Contenders concurrently claiming the same field across 3 nodes with drifted clocks:
+      # Node 1: clock is 100ms behind real time
+      # Node 2: clock is at real time
+      # Node 3: clock is 80ms ahead of real time
+      node1_claim = %{
+        client_id: "node1_client_b",
+        user_id: "u_bob",
+        acquired_at: base_time - 100,
+        field: "balance"
+      }
+
+      node2_claim = %{
+        client_id: "node2_client_c",
+        user_id: "u_charlie",
+        acquired_at: base_time,
+        field: "balance"
+      }
+
+      node3_claim = %{
+        client_id: "node3_client_a",
+        user_id: "u_alice",
+        acquired_at: base_time + 80,
+        field: "balance"
+      }
+
+      claims = [node1_claim, node2_claim, node3_claim]
+
+      # Shuffled to simulate gossip message arrival orders on different nodes
+      perm1 = Enum.shuffle(claims)
+      perm2 = Enum.shuffle(claims)
+      perm3 = Enum.shuffle(claims)
+
+      # With 500ms tolerance, all fall into the same concurrency window
+      # The winner MUST be chosen deterministically by client_id ("node3_client_a")
+      winner1 = Field.resolve_conflict(perm1, 500)
+      winner2 = Field.resolve_conflict(perm2, 500)
+      winner3 = Field.resolve_conflict(perm3, 500)
+
+      assert winner1.client_id == "node3_client_a"
+      assert winner2.client_id == "node3_client_a"
+      assert winner3.client_id == "node3_client_a"
+    end
+
+    test "re-focusing the same field preserves lock acquisition seniority timestamp" do
+      topic = "live_collab:seniority_test:1"
+      user = %{id: "u1", name: "Alice"}
+      client_id = "cli_senior_1"
+
+      {:ok, _} = Presence.track(TestPresence, self(), topic, user, client_id)
+
+      # Focus field first time
+      Presence.update_field(TestPresence, self(), topic, user.id, "email", client_id)
+      entries1 = TestPresence.list(topic)
+      initial_meta = hd(entries1[to_string(user.id)].metas)
+      initial_acquired_at = initial_meta.acquired_at
+      assert is_integer(initial_acquired_at) and initial_acquired_at > 0
+
+      # Simulate re-render or re-focus on the same field
+      Presence.update_field(TestPresence, self(), topic, user.id, "email", client_id)
+      entries2 = TestPresence.list(topic)
+      updated_meta = hd(entries2[to_string(user.id)].metas)
+
+      # Acquired timestamp must be strictly preserved!
+      assert updated_meta.acquired_at == initial_acquired_at
+    end
+
+    test "handle_presence_sync resets local editing field if lock dropped in Presence" do
+      # Socket believed it was editing "notes"
+      socket = %Phoenix.LiveView.Socket{
+        assigns: %{
+          collab_client_id: "cli_local",
+          collab_editing_field: "notes",
+          collab_users: [],
+          collab_locks: %{},
+          collab_activities: %{},
+          collab_config: %LiveCollab.Config{}
+        }
+      }
+
+      # Presence topic has no locks
+      synced_socket = LiveCollab.LiveView.handle_presence_sync(socket, TestPresence, "empty_topic")
+
+      # Local editing field was safely reset to nil
+      assert synced_socket.assigns.collab_editing_field == nil
+    end
+  end
 end

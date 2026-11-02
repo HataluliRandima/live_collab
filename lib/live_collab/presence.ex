@@ -101,12 +101,25 @@ defmodule LiveCollab.Presence do
           client_id :: String.t()
         ) :: {:ok, binary()} | {:error, term()}
   def update_field(presence_module, pid_or_socket, topic, user_id, field_id, client_id) do
-    now = if field_id, do: System.system_time(:millisecond), else: 0
+    now = System.system_time(:millisecond)
 
     presence_module.update(pid_or_socket, topic, to_string(user_id), fn existing_meta ->
+      acquired_at =
+        cond do
+          is_nil(field_id) ->
+            0
+
+          existing_meta[:field] == field_id and is_integer(existing_meta[:acquired_at]) and
+              existing_meta[:acquired_at] > 0 ->
+            existing_meta[:acquired_at]
+
+          true ->
+            now
+        end
+
       Map.merge(existing_meta, %{
         field: field_id,
-        acquired_at: now,
+        acquired_at: acquired_at,
         client_id: client_id
       })
     end)
@@ -147,13 +160,27 @@ defmodule LiveCollab.Presence do
         activity_type,
         client_id
       ) do
-    now = if element_id, do: System.system_time(:millisecond), else: 0
+    now = System.system_time(:millisecond)
 
     presence_module.update(pid_or_socket, topic, to_string(user_id), fn existing_meta ->
+      acquired_at =
+        cond do
+          is_nil(element_id) ->
+            0
+
+          existing_meta[:element] == element_id and
+            is_integer(existing_meta[:element_acquired_at]) and
+              existing_meta[:element_acquired_at] > 0 ->
+            existing_meta[:element_acquired_at]
+
+          true ->
+            now
+        end
+
       Map.merge(existing_meta, %{
         element: element_id,
         element_type: activity_type,
-        element_acquired_at: now,
+        element_acquired_at: acquired_at,
         client_id: client_id
       })
     end)

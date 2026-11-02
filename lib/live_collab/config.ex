@@ -15,18 +15,27 @@ defmodule LiveCollab.Config do
 
   @default_prefix "live_collab"
   @default_max_field_len 255
+  @default_telemetry_rate 50
+  @default_telemetry_burst 60
+  @default_clock_skew_tolerance_ms 500
 
   @type t :: %__MODULE__{
           pubsub: atom() | nil,
           presence: atom() | nil,
           topic_prefix: String.t(),
-          max_field_id_length: pos_integer()
+          max_field_id_length: pos_integer(),
+          telemetry_rate_per_sec: pos_integer(),
+          telemetry_burst_limit: pos_integer(),
+          clock_skew_tolerance_ms: non_neg_integer()
         }
 
   defstruct pubsub: nil,
             presence: nil,
             topic_prefix: @default_prefix,
-            max_field_id_length: @default_max_field_len
+            max_field_id_length: @default_max_field_len,
+            telemetry_rate_per_sec: @default_telemetry_rate,
+            telemetry_burst_limit: @default_telemetry_burst,
+            clock_skew_tolerance_ms: @default_clock_skew_tolerance_ms
 
   @doc """
   Returns a resolved configuration struct merging application environment with any overrides.
@@ -45,6 +54,24 @@ defmodule LiveCollab.Config do
           overrides,
           :max_field_id_length,
           Keyword.get(env, :max_field_id_length, @default_max_field_len)
+        ),
+      telemetry_rate_per_sec:
+        Keyword.get(
+          overrides,
+          :telemetry_rate_per_sec,
+          Keyword.get(env, :telemetry_rate_per_sec, @default_telemetry_rate)
+        ),
+      telemetry_burst_limit:
+        Keyword.get(
+          overrides,
+          :telemetry_burst_limit,
+          Keyword.get(env, :telemetry_burst_limit, @default_telemetry_burst)
+        ),
+      clock_skew_tolerance_ms:
+        Keyword.get(
+          overrides,
+          :clock_skew_tolerance_ms,
+          Keyword.get(env, :clock_skew_tolerance_ms, @default_clock_skew_tolerance_ms)
         )
     }
   end

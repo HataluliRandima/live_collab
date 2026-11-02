@@ -29,6 +29,7 @@ defmodule LiveCollab.LiveView do
   alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.Presence
+  alias LiveCollab.RateLimiter
   alias LiveCollab.Viewport
 
   @doc """
@@ -54,6 +55,13 @@ defmodule LiveCollab.LiveView do
     user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
     user_key = to_string(user_id)
 
+    # Initialize purely functional token bucket rate limiter for telemetry
+    rate_limiter =
+      RateLimiter.new(
+        rate: config.telemetry_rate_per_sec,
+        burst: config.telemetry_burst_limit
+      )
+
     # Only track if socket is connected to avoid tracking static HTTP pre-renders
     socket =
       if connected?(socket) do
@@ -67,6 +75,7 @@ defmodule LiveCollab.LiveView do
         socket
         |> attach_collab_event_hook(config, presence_mod, user)
         |> attach_collab_info_hook(config, presence_mod, topic)
+        |> push_event("live_collab:init", %{client_id: client_id})
       else
         socket
       end
@@ -76,7 +85,10 @@ defmodule LiveCollab.LiveView do
       if connected?(socket), do: presence_mod.list(topic), else: %{}
 
     users = Presence.extract_users(presence_entries)
-    locks = Field.extract_locks(presence_entries)
+    locks =
+      Field.extract_locks(presence_entries,
+        clock_skew_tolerance_ms: config.clock_skew_tolerance_ms
+      )
     activities = Element.extract_activities(presence_entries)
 
     socket
@@ -84,6 +96,7 @@ defmodule LiveCollab.LiveView do
     |> assign(:collab_pubsub, pubsub_server)
     |> assign(:collab_client_id, client_id)
     |> assign(:collab_user_key, user_key)
+    |> assign(:collab_rate_limiter, rate_limiter)
     |> assign(:collab_users, users)
     |> assign(:collab_locks, locks)
     |> assign(:collab_activities, activities)
@@ -133,9 +146,13 @@ defmodule LiveCollab.LiveView do
           topic :: String.t()
         ) :: Phoenix.LiveView.Socket.t()
   def handle_presence_sync(socket, presence_module, topic) do
+    config = socket.assigns[:collab_config] || Config.get()
     entries = presence_module.list(topic)
     new_users = Presence.extract_users(entries)
-    new_locks = Field.extract_locks(entries)
+    new_locks =
+      Field.extract_locks(entries,
+        clock_skew_tolerance_ms: config.clock_skew_tolerance_ms
+      )
     new_activities = Element.extract_activities(entries)
 
     current_client_id = socket.assigns[:collab_client_id]
@@ -162,7 +179,8 @@ defmodule LiveCollab.LiveView do
             })
 
           nil ->
-            socket
+            # Lock was dropped from presence; reset local editing state
+            assign(socket, :collab_editing_field, nil)
         end
       else
         socket
@@ -337,18 +355,26 @@ defmodule LiveCollab.LiveView do
         if is_nil(client_id) do
           {:halt, sock}
         else
-          case Cursor.validate_coordinates(x, y) do
-            {:ok, nx, ny} ->
-              topic = sock.assigns.collab_topic
-              pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
-              container_id = params["container_id"]
-              payload = Cursor.build_payload(client_id, user, nx, ny, container_id)
+          case RateLimiter.check(sock.assigns[:collab_rate_limiter]) do
+            {:allow, updated_limiter} ->
+              sock = assign(sock, :collab_rate_limiter, updated_limiter)
 
-              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
-              {:halt, sock}
+              case Cursor.validate_coordinates(x, y) do
+                {:ok, nx, ny} ->
+                  topic = sock.assigns.collab_topic
+                  pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+                  container_id = params["container_id"]
+                  payload = Cursor.build_payload(client_id, user, nx, ny, container_id)
 
-            {:error, _reason} ->
-              {:halt, sock}
+                  Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
+                  {:halt, sock}
+
+                {:error, _reason} ->
+                  {:halt, sock}
+              end
+
+            {:deny, updated_limiter} ->
+              {:halt, assign(sock, :collab_rate_limiter, updated_limiter)}
           end
         end
 
@@ -381,25 +407,32 @@ defmodule LiveCollab.LiveView do
         if is_nil(client_id) do
           {:halt, sock}
         else
-          zoom = params["zoom"] || 1.0
+          case RateLimiter.check(sock.assigns[:collab_rate_limiter]) do
+            {:allow, updated_limiter} ->
+              sock = assign(sock, :collab_rate_limiter, updated_limiter)
+              zoom = params["zoom"] || 1.0
 
-          case Viewport.validate_viewport(sx, sy, zoom) do
-            {:ok, nsx, nsy, nzoom} ->
-              topic = sock.assigns.collab_topic
-              pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+              case Viewport.validate_viewport(sx, sy, zoom) do
+                {:ok, nsx, nsy, nzoom} ->
+                  topic = sock.assigns.collab_topic
+                  pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
 
-              payload =
-                Viewport.build_viewport_payload(client_id, user, nsx, nsy,
-                  zoom: nzoom,
-                  container_id: params["container_id"],
-                  anchor_element_id: params["anchor_element_id"]
-                )
+                  payload =
+                    Viewport.build_viewport_payload(client_id, user, nsx, nsy,
+                      zoom: nzoom,
+                      container_id: params["container_id"],
+                      anchor_element_id: params["anchor_element_id"]
+                    )
 
-              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
-              {:halt, sock}
+                  Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
+                  {:halt, sock}
 
-            {:error, _reason} ->
-              {:halt, sock}
+                {:error, _reason} ->
+                  {:halt, sock}
+              end
+
+            {:deny, updated_limiter} ->
+              {:halt, assign(sock, :collab_rate_limiter, updated_limiter)}
           end
         end
 
@@ -455,22 +488,30 @@ defmodule LiveCollab.LiveView do
         if is_nil(client_id) do
           {:halt, sock}
         else
-          case Viewport.validate_selection(x, y, w, h) do
-            {:ok, nx, ny, nw, nh} ->
-              topic = sock.assigns.collab_topic
-              pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+          case RateLimiter.check(sock.assigns[:collab_rate_limiter]) do
+            {:allow, updated_limiter} ->
+              sock = assign(sock, :collab_rate_limiter, updated_limiter)
 
-              payload =
-                Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
-                  container_id: params["container_id"],
-                  selected_ids: params["selected_ids"] || []
-                )
+              case Viewport.validate_selection(x, y, w, h) do
+                {:ok, nx, ny, nw, nh} ->
+                  topic = sock.assigns.collab_topic
+                  pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
 
-              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
-              {:halt, sock}
+                  payload =
+                    Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
+                      container_id: params["container_id"],
+                      selected_ids: params["selected_ids"] || []
+                    )
 
-            {:error, _reason} ->
-              {:halt, sock}
+                  Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
+                  {:halt, sock}
+
+                {:error, _reason} ->
+                  {:halt, sock}
+              end
+
+            {:deny, updated_limiter} ->
+              {:halt, assign(sock, :collab_rate_limiter, updated_limiter)}
           end
         end
 
@@ -706,25 +747,32 @@ defmodule LiveCollab.LiveView do
         if is_nil(client_id) do
           {:noreply, socket}
         else
-          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-          user = socket.assigns[:current_user] || %{}
+          case LiveCollab.RateLimiter.check(socket.assigns[:collab_rate_limiter]) do
+            {:allow, updated_limiter} ->
+              socket = assign(socket, :collab_rate_limiter, updated_limiter)
+              config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+              user = socket.assigns[:current_user] || %{}
 
-          case LiveCollab.Cursor.validate_coordinates(x, y) do
-            {:ok, nx, ny} ->
-              topic = socket.assigns.collab_topic
+              case LiveCollab.Cursor.validate_coordinates(x, y) do
+                {:ok, nx, ny} ->
+                  topic = socket.assigns.collab_topic
 
-              pubsub =
-                socket.assigns[:collab_pubsub] || config.pubsub ||
-                  LiveCollab.LiveView.default_pubsub_server(config.presence)
+                  pubsub =
+                    socket.assigns[:collab_pubsub] || config.pubsub ||
+                      LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-              container_id = params["container_id"]
-              payload = LiveCollab.Cursor.build_payload(client_id, user, nx, ny, container_id)
+                  container_id = params["container_id"]
+                  payload = LiveCollab.Cursor.build_payload(client_id, user, nx, ny, container_id)
 
-              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
-              {:noreply, socket}
+                  Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
+                  {:noreply, socket}
 
-            {:error, _} ->
-              {:noreply, socket}
+                {:error, _} ->
+                  {:noreply, socket}
+              end
+
+            {:deny, updated_limiter} ->
+              {:noreply, assign(socket, :collab_rate_limiter, updated_limiter)}
           end
         end
       end
@@ -764,30 +812,37 @@ defmodule LiveCollab.LiveView do
         if is_nil(client_id) do
           {:noreply, socket}
         else
-          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-          user = socket.assigns[:current_user] || %{}
-          zoom = params["zoom"] || 1.0
+          case LiveCollab.RateLimiter.check(socket.assigns[:collab_rate_limiter]) do
+            {:allow, updated_limiter} ->
+              socket = assign(socket, :collab_rate_limiter, updated_limiter)
+              config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+              user = socket.assigns[:current_user] || %{}
+              zoom = params["zoom"] || 1.0
 
-          case LiveCollab.Viewport.validate_viewport(sx, sy, zoom) do
-            {:ok, nsx, nsy, nzoom} ->
-              topic = socket.assigns.collab_topic
+              case LiveCollab.Viewport.validate_viewport(sx, sy, zoom) do
+                {:ok, nsx, nsy, nzoom} ->
+                  topic = socket.assigns.collab_topic
 
-              pubsub =
-                socket.assigns[:collab_pubsub] || config.pubsub ||
-                  LiveCollab.LiveView.default_pubsub_server(config.presence)
+                  pubsub =
+                    socket.assigns[:collab_pubsub] || config.pubsub ||
+                      LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-              payload =
-                LiveCollab.Viewport.build_viewport_payload(client_id, user, nsx, nsy,
-                  zoom: nzoom,
-                  container_id: params["container_id"],
-                  anchor_element_id: params["anchor_element_id"]
-                )
+                  payload =
+                    LiveCollab.Viewport.build_viewport_payload(client_id, user, nsx, nsy,
+                      zoom: nzoom,
+                      container_id: params["container_id"],
+                      anchor_element_id: params["anchor_element_id"]
+                    )
 
-              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
-              {:noreply, socket}
+                  Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
+                  {:noreply, socket}
 
-            {:error, _} ->
-              {:noreply, socket}
+                {:error, _} ->
+                  {:noreply, socket}
+              end
+
+            {:deny, updated_limiter} ->
+              {:noreply, assign(socket, :collab_rate_limiter, updated_limiter)}
           end
         end
       end
@@ -858,28 +913,35 @@ defmodule LiveCollab.LiveView do
         if is_nil(client_id) do
           {:noreply, socket}
         else
-          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-          user = socket.assigns[:current_user] || %{}
+          case LiveCollab.RateLimiter.check(socket.assigns[:collab_rate_limiter]) do
+            {:allow, updated_limiter} ->
+              socket = assign(socket, :collab_rate_limiter, updated_limiter)
+              config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+              user = socket.assigns[:current_user] || %{}
 
-          case LiveCollab.Viewport.validate_selection(x, y, w, h) do
-            {:ok, nx, ny, nw, nh} ->
-              topic = socket.assigns.collab_topic
+              case LiveCollab.Viewport.validate_selection(x, y, w, h) do
+                {:ok, nx, ny, nw, nh} ->
+                  topic = socket.assigns.collab_topic
 
-              pubsub =
-                socket.assigns[:collab_pubsub] || config.pubsub ||
-                  LiveCollab.LiveView.default_pubsub_server(config.presence)
+                  pubsub =
+                    socket.assigns[:collab_pubsub] || config.pubsub ||
+                      LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-              payload =
-                LiveCollab.Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
-                  container_id: params["container_id"],
-                  selected_ids: params["selected_ids"] || []
-                )
+                  payload =
+                    LiveCollab.Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
+                      container_id: params["container_id"],
+                      selected_ids: params["selected_ids"] || []
+                    )
 
-              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
-              {:noreply, socket}
+                  Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
+                  {:noreply, socket}
 
-            {:error, _} ->
-              {:noreply, socket}
+                {:error, _} ->
+                  {:noreply, socket}
+              end
+
+            {:deny, updated_limiter} ->
+              {:noreply, assign(socket, :collab_rate_limiter, updated_limiter)}
           end
         end
       end
