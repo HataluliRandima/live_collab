@@ -129,4 +129,3 @@ defmodule LiveCollab.ViewportTest do
     end
   end
 end
-

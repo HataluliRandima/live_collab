@@ -60,4 +60,3 @@ defmodule LiveCollab.CursorTest do
     end
   end
 end
-
