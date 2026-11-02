@@ -1,0 +1,18 @@
+{
+  "name": "live_collab",
+  "version": "0.1.0",
+  "description": "Client-side hooks and utilities for LiveCollab Phoenix LiveView library",
+  "main": "js/live_collab/index.js",
+  "module": "js/live_collab/index.js",
+  "license": "MIT",
+  "scripts": {
+    "build": "echo 'Pure ES module, no build step required'"
+  },
+  "keywords": [
+    "phoenix",
+    "liveview",
+    "collaboration",
+    "multiplayer",
+    "presence"
+  ]
+}
