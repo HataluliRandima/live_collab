@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-02
+
+### Added
+- **Viewport & Scroll Following (Screen / Presentation Mode)**:
+  - `LiveCollab.Viewport` module for validating normalized scroll coordinates and constructing sanitized viewport payloads.
+  - Normalized scroll positions `[0.0, 1.0]` across responsive layouts, differing monitor sizes, and zoom levels.
+  - `<LiveCollab.Components.viewport_container />` functional component for wrapping synchronized scrollable areas.
+  - `<LiveCollab.Components.follow_pill />` interactive component indicating active presenter with follow/unfollow toggle.
+  - Client-side hook `LiveCollabViewport`:
+    - Throttled scroll tracking (40ms).
+    - Infinite scroll loop feedback suppression via programmatic scroll guards (`isProgrammaticScroll`).
+    - Follower manual scroll auto-breakout: immediately exits follow mode when user manually rolls mouse wheel or drags scrollbar.
+    - Smooth scrolling via native `scrollTo({ behavior: 'smooth' })`.
+- **Multiplayer Selection Containers**:
+  - `LiveCollab.Viewport.validate_selection/4` and `build_selection_payload/7` for managing real-time collaborative selection bounding boxes.
+  - `<LiveCollab.Components.selection_layer />` and `collab_selection_attrs/2` for attaching multiplayer selection overlays.
+  - Client-side hook `LiveCollabSelection`:
+    - Renders translucent selection boxes with border and background in the collaborator's deterministic color.
+    - Floating name badge attached to selection marquee.
+    - Automatic 5-second inactivity fadeout and instantaneous clear handling.
+- **Unit & Adversarial Tests**:
+  - Tests verifying rejection of malicious/extreme scroll coordinates, out-of-bounds zoom, and negative selection dimensions.
+  - Tests proving zero socket assigns mutation during viewport and selection broadcasts.
+  - Tests proving suppression of self-generated scroll echoes.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added

@@ -120,4 +120,38 @@ defmodule LiveCollab.ComponentsTest do
       assert Keyword.get(attrs, :"data-collab-deadband") == "0.005"
     end
   end
+
+  describe "collab_viewport_attrs/2" do
+    test "generates default viewport hook attributes" do
+      attrs = Components.collab_viewport_attrs("doc_view")
+
+      assert Keyword.get(attrs, :"phx-hook") == "LiveCollabViewport"
+      assert Keyword.get(attrs, :"data-collab-container") == "doc_view"
+      assert Keyword.get(attrs, :"data-collab-presenter") == "false"
+      assert Keyword.get(attrs, :"data-collab-throttle") == "40"
+      refute Keyword.has_key?(attrs, :"data-collab-following")
+    end
+
+    test "includes presenter and following attributes when provided" do
+      attrs =
+        Components.collab_viewport_attrs("doc_view",
+          presenter: true,
+          following: "leader_client_1",
+          throttle: 60
+        )
+
+      assert Keyword.get(attrs, :"data-collab-presenter") == "true"
+      assert Keyword.get(attrs, :"data-collab-following") == "leader_client_1"
+      assert Keyword.get(attrs, :"data-collab-throttle") == "60"
+    end
+  end
+
+  describe "collab_selection_attrs/2" do
+    test "generates selection hook attributes" do
+      attrs = Components.collab_selection_attrs("artboard_1")
+
+      assert Keyword.get(attrs, :"phx-hook") == "LiveCollabSelection"
+      assert Keyword.get(attrs, :"data-collab-container") == "artboard_1"
+    end
+  end
 end

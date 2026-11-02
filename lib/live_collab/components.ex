@@ -385,6 +385,90 @@ defmodule LiveCollab.Components do
   end
 
   @doc """
+  Renders a container with collaborative viewport and scroll following.
+
+  ## Examples
+
+      <.viewport_container container_id="doc_viewport" class="overflow-y-auto h-screen">
+        <div>Long document content</div>
+      </.viewport_container>
+  """
+  attr :container_id, :string, default: "default"
+  attr :presenter, :boolean, default: false, doc: "Whether this client is broadcasting scroll position as presenter"
+  attr :following, :string, default: nil, doc: "Client ID of presenter to follow"
+  attr :throttle, :integer, default: 40, doc: "Scroll broadcast throttle in milliseconds"
+  attr :class, :string, default: nil
+  slot :inner_block, required: false
+
+  def viewport_container(assigns) do
+    ~H"""
+    <div
+      class={["live-collab-viewport-container", @class]}
+      {collab_viewport_attrs(@container_id,
+        presenter: @presenter,
+        following: @following,
+        throttle: @throttle
+      )}
+    >
+      <%= render_slot(@inner_block) %>
+    </div>
+    """
+  end
+
+  @doc """
+  Renders an interactive pill showing who is currently presenting/leading, with
+  a button to follow or unfollow.
+  """
+  attr :leader_name, :string, required: true
+  attr :leader_client_id, :string, required: true
+  attr :leader_color, :string, default: "#4F46E5"
+  attr :is_following, :boolean, default: false
+  attr :class, :string, default: nil
+
+  def follow_pill(assigns) do
+    ~H"""
+    <div
+      class={[
+        "live-collab-follow-pill inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium shadow-md transition-all select-none",
+        if(@is_following, do: "bg-gray-900 text-white ring-2 ring-indigo-500", else: "bg-white text-gray-800 border border-gray-200"),
+        @class
+      ]}
+    >
+      <span class="w-2 h-2 rounded-full animate-pulse" style={"background-color: #{@leader_color};"}></span>
+      <span><%= @leader_name %> is presenting</span>
+      <button
+        type="button"
+        class={[
+          "ml-1 px-2 py-0.5 rounded text-[11px] font-semibold transition-colors",
+          if(@is_following, do: "bg-gray-800 text-gray-200 hover:bg-gray-700", else: "bg-indigo-600 text-white hover:bg-indigo-500")
+        ]}
+        onclick={"this.closest('.live-collab-viewport-container, body').dispatchEvent(new CustomEvent('#{if @is_following, do: "live_collab:stop_follow", else: "live_collab:start_follow"}', {bubbles: true, detail: {client_id: '#{@leader_client_id}'}}))"}
+      >
+        <%= if @is_following, do: "Stop Following", else: "Follow" %>
+      </button>
+    </div>
+    """
+  end
+
+  @doc """
+  Renders an overlay container that displays real-time multiplayer selection bounding boxes.
+  """
+  attr :container_id, :string, default: "default"
+  attr :class, :string, default: nil
+  slot :inner_block, required: false
+
+  def selection_layer(assigns) do
+    ~H"""
+    <div
+      class={["live-collab-selection-container relative", @class]}
+      {collab_selection_attrs(@container_id)}
+    >
+      <%= render_slot(@inner_block) %>
+    </div>
+    """
+  end
+
+  @doc """
   Generates HTML tag attributes to attach the `LiveCollabCursor` hook to any
   existing container element (e.g. document body, SVG canvas, artboard).
 
@@ -403,6 +487,50 @@ defmodule LiveCollab.Components do
       "data-collab-container": container_id,
       "data-collab-throttle": to_string(throttle),
       "data-collab-deadband": to_string(deadband)
+    ]
+  end
+
+  @doc """
+  Generates HTML tag attributes to attach the `LiveCollabViewport` hook to any
+  scrollable container or document body.
+
+  ## Options
+
+  - `presenter` - Boolean indicating if this client broadcasts scroll coordinates (default `false`).
+  - `following` - Client ID string of presenter currently being followed.
+  - `throttle` - Milliseconds between scroll broadcasts (default `40`).
+  """
+  @spec collab_viewport_attrs(container_id :: String.t(), opts :: keyword()) :: list()
+  def collab_viewport_attrs(container_id \\ "default", opts \\ []) do
+    presenter = Keyword.get(opts, :presenter, false)
+    following = Keyword.get(opts, :following)
+    throttle = Keyword.get(opts, :throttle, 40)
+
+    attrs = [
+      "phx-hook": "LiveCollabViewport",
+      "data-collab-container": container_id,
+      "data-collab-presenter": to_string(presenter),
+      "data-collab-throttle": to_string(throttle)
+    ]
+
+    attrs =
+      if following do
+        attrs ++ ["data-collab-following": to_string(following)]
+      else
+        attrs
+      end
+
+    attrs
+  end
+
+  @doc """
+  Generates HTML tag attributes to attach the `LiveCollabSelection` hook to a canvas or container.
+  """
+  @spec collab_selection_attrs(container_id :: String.t(), opts :: keyword()) :: list()
+  def collab_selection_attrs(container_id \\ "default", _opts \\ []) do
+    [
+      "phx-hook": "LiveCollabSelection",
+      "data-collab-container": container_id
     ]
   end
 

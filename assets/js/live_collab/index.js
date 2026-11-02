@@ -17,12 +17,23 @@
 import { LiveCollabField } from "./hooks/live_collab_field.js";
 import { LiveCollabElement } from "./hooks/live_collab_element.js";
 import { LiveCollabCursor } from "./hooks/live_collab_cursor.js";
+import { LiveCollabViewport } from "./hooks/live_collab_viewport.js";
+import { LiveCollabSelection } from "./hooks/live_collab_selection.js";
 
 export const LiveCollabHooks = {
   LiveCollabField,
   LiveCollabElement,
-  LiveCollabCursor
+  LiveCollabCursor,
+  LiveCollabViewport,
+  LiveCollabSelection
 };
 
-export { LiveCollabField, LiveCollabElement, LiveCollabCursor };
+export {
+  LiveCollabField,
+  LiveCollabElement,
+  LiveCollabCursor,
+  LiveCollabViewport,
+  LiveCollabSelection
+};
+
 export default LiveCollabHooks;

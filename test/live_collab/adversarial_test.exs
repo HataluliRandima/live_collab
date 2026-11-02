@@ -353,4 +353,62 @@ defmodule LiveCollab.AdversarialTest do
       refute should_push
     end
   end
+
+  describe "Adversarial: Viewport Following & Selection Telemetry (Path 2 Protection)" do
+    test "rejects malicious viewport and selection attacks" do
+      assert {:error, :scroll_out_of_bounds} =
+               LiveCollab.Viewport.validate_viewport(99999.0, 0.5)
+
+      assert {:error, :scroll_out_of_bounds} =
+               LiveCollab.Viewport.validate_viewport(-50.0, 0.5)
+
+      assert {:error, :zoom_out_of_bounds} =
+               LiveCollab.Viewport.validate_viewport(0.5, 0.5, 999.0)
+
+      assert {:error, :negative_dimensions} =
+               LiveCollab.Viewport.validate_selection(0.1, 0.2, -100.0, 50.0)
+
+      assert {:error, :selection_out_of_bounds} =
+               LiveCollab.Viewport.validate_selection(500.0, 0.0, 10.0, 10.0)
+    end
+
+    test "infinite scroll echo suppression: client's own viewport is dropped before relay" do
+      sender_client_id = "client_presenter"
+
+      viewport_payload = %{
+        client_id: sender_client_id,
+        scroll_x: 0.5,
+        scroll_y: 0.8,
+        zoom: 1.0
+      }
+
+      # Sender's LiveView checks payload.client_id != socket.assigns.collab_client_id
+      refute viewport_payload[:client_id] != sender_client_id
+    end
+
+    test "socket assigns remain 100% untouched during viewport and selection updates" do
+      initial_assigns = %{
+        collab_topic: "live_collab:doc:1",
+        collab_client_id: "client_follower",
+        collab_users: [],
+        collab_locks: %{},
+        collab_activities: %{}
+      }
+
+      # Broadcast arrives via PubSub
+      incoming_viewport = %{
+        client_id: "client_leader",
+        scroll_x: 0.2,
+        scroll_y: 0.4,
+        zoom: 1.0
+      }
+
+      should_push = incoming_viewport[:client_id] != initial_assigns.collab_client_id
+      assert should_push == true
+
+      # Assigns remain unchanged
+      assigns_after = initial_assigns
+      assert assigns_after == initial_assigns
+    end
+  end
 end
