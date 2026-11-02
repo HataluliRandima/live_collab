@@ -73,18 +73,48 @@ defmodule LiveCollab.Field do
   @doc """
   Resolves a list of competing field claims into a deterministic winner.
 
-  Uses `{acquired_at, client_id}` ordering. Earliest acquisition wins;
-  stable lexicographical client ID tie-breaker for simultaneous timestamps.
+  Uses `{time_bucket, client_id, user_id}` ordering:
+  - Bins timestamps into `clock_skew_tolerance_ms` windows (default 500ms).
+  - Claims acquired earlier outside the tolerance window win decisively.
+  - Claims acquired within the same tolerance window are treated as concurrent,
+    breaking ties deterministically by `client_id` (and `user_id` as secondary)
+    without vulnerability to inter-node clock skew.
+  - Future timestamp drift and invalid timestamps are safely bounded.
   """
-  @spec resolve_conflict([lock_meta()]) :: lock_meta() | nil
-  def resolve_conflict([]), do: nil
-  def resolve_conflict([single]), do: single
+  @spec resolve_conflict([lock_meta()], non_neg_integer()) :: lock_meta() | nil
+  def resolve_conflict(claims, clock_skew_tolerance_ms \\ 500)
+  def resolve_conflict([], _tolerance), do: nil
+  def resolve_conflict([single], _tolerance), do: single
 
-  def resolve_conflict(claims) when is_list(claims) do
+  def resolve_conflict(claims, clock_skew_tolerance_ms) when is_list(claims) do
+    now = System.system_time(:millisecond)
+
     Enum.min_by(claims, fn claim ->
+      acquired_at = Map.get(claim, :acquired_at, :infinity)
+
+      sanitized_at =
+        cond do
+          not is_integer(acquired_at) or acquired_at <= 0 ->
+            :infinity
+
+          is_integer(acquired_at) and acquired_at > now + clock_skew_tolerance_ms ->
+            now + clock_skew_tolerance_ms
+
+          true ->
+            acquired_at
+        end
+
+      time_key =
+        if is_integer(sanitized_at) and clock_skew_tolerance_ms > 0 do
+          div(sanitized_at, clock_skew_tolerance_ms)
+        else
+          sanitized_at
+        end
+
       {
-        Map.get(claim, :acquired_at, :infinity),
-        to_string(Map.get(claim, :client_id, ""))
+        time_key,
+        to_string(Map.get(claim, :client_id, "")),
+        to_string(Map.get(claim, :user_id, ""))
       }
     end)
   end
@@ -95,8 +125,10 @@ defmodule LiveCollab.Field do
 
   Returns a map of `%{field_id => lock_meta}`.
   """
-  @spec extract_locks(map()) :: locks_map()
-  def extract_locks(presence_entries) when is_map(presence_entries) do
+  @spec extract_locks(map(), keyword()) :: locks_map()
+  def extract_locks(presence_entries, opts \\ []) when is_map(presence_entries) do
+    tolerance = Keyword.get(opts, :clock_skew_tolerance_ms, 500)
+
     claims_by_field =
       for {_key, %{metas: metas}} <- presence_entries,
           meta <- metas,
@@ -107,7 +139,7 @@ defmodule LiveCollab.Field do
       |> Enum.group_by(fn {field, _meta} -> field end, fn {_field, meta} -> meta end)
 
     claims_by_field
-    |> Enum.map(fn {field, claims} -> {field, resolve_conflict(claims)} end)
+    |> Enum.map(fn {field, claims} -> {field, resolve_conflict(claims, tolerance)} end)
     |> Enum.into(%{})
   end
 

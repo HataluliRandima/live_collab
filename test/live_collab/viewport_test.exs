@@ -92,6 +92,41 @@ defmodule LiveCollab.ViewportTest do
       assert payload.height == 0.3
       assert payload.selected_ids == ["card_1", "card_2"]
     end
+
+    test "sanitizes, truncates, and bounds selected_ids to prevent memory exhaustion" do
+      user = %{id: "user_1", name: "Alice"}
+      client_id = "cli_alice"
+
+      # 500 items, some non-binary, some over 255 bytes
+      oversized_id = String.duplicate("x", 500)
+      huge_list =
+        [oversized_id, 12345, %{"bad" => "map"}, nil, "valid_card"] ++
+          Enum.map(1..495, fn i -> "item_#{i}" end)
+
+      payload =
+        Viewport.build_selection_payload(client_id, user, 0.1, 0.1, 0.5, 0.5,
+          selected_ids: huge_list
+        )
+
+      # Must cap at 100 items
+      assert length(payload.selected_ids) == 100
+
+      # First item must be sliced to 255 bytes
+      first_item = hd(payload.selected_ids)
+      assert byte_size(first_item) == 255
+      assert first_item == String.duplicate("x", 255)
+
+      # Non-binary items (integer, map, nil) must be stripped
+      refute Enum.any?(payload.selected_ids, fn id -> not is_binary(id) end)
+
+      # Handles non-list argument gracefully
+      bad_payload =
+        Viewport.build_selection_payload(client_id, user, 0.1, 0.1, 0.5, 0.5,
+          selected_ids: "not_a_list"
+        )
+
+      assert bad_payload.selected_ids == []
+    end
   end
 end
 

@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-02
+
+### Security & Hardening (Red Team Remediation)
+- **Client ID Injection Defense**: Wire-level parameter `params["client_id"]` is completely ignored across all event handlers (`field_focus`, `field_blur`, `element_active`, `element_inactive`, `cursor_move`, `cursor_left`, `viewport_move`, `spotlight_lead`, `spotlight_stop`, `selection_move`, `selection_clear`), strictly enforcing server-side `sock.assigns[:collab_client_id]`.
+- **Presence Untrack Key Parity**: Fixed defect in `LiveCollab.LiveView.untrack/2` where client_id was passed instead of user_key, leaving ghost sessions in `Phoenix.Presence`. Sessions are now tracked and untracked via `socket.assigns[:collab_user_key]`.
+- **Spotlight Authorization Guards**: Added `authorized_spotlight_leader?/2` and `can_stop_spotlight?/3` in `LiveCollab.LiveView`. Unprivileged viewers (`role: "viewer"`, `collab_can_present?: false`) are rejected from claiming or terminating spotlight broadcasts.
+- **Selection Marquee Bounding**: Added `LiveCollab.Viewport.sanitize_selected_ids/1` capping selection arrays at 100 items and truncating IDs at 255 bytes to eliminate payload bombing and memory exhaustion risks.
+- **Functional Token Bucket Rate Limiter**: Added `LiveCollab.RateLimiter` managing in-memory token buckets in socket assigns. Drops flood telemetry bursts beyond configured limits (default: 50 events/sec, 60 burst) without GenServer or ETS overhead.
+- **Multi-Node Cluster Clock-Skew Hardening**: Hardened `LiveCollab.Field.resolve_conflict/2` with windowed bucketing (`clock_skew_tolerance_ms: 500`). Claims arriving within the concurrency window break ties deterministically by `client_id` rather than raw drifting milliseconds.
+- **Lock Seniority Preservation**: Re-focusing an already locked field in `Presence.update_field/6` preserves `acquired_at` rather than resetting seniority.
+- **Lifecycle Hook Arity Fix**: Aligned `attach_collab_event_hook` invocation in `track/4` to arity 4.
+- **Hex Metadata Alignment**: Corrected repository URLs to `https://github.com/HataluliRandima/live_collab`, added MIT `LICENSE` file, and synchronized `package.json` version.
+
 ## [0.3.0] - 2026-11-02
 
 ### Added

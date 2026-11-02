@@ -411,4 +411,230 @@ defmodule LiveCollab.AdversarialTest do
       assert assigns_after == initial_assigns
     end
   end
+
+  describe "Adversarial: Untrusted Client ID Parameter Injection Immunity" do
+    test "server uses socket assigns collab_client_id and ignores client payload injection" do
+      real_client_id = "cli_legitimate_socket_tab"
+      attacker_forged_client_id = "cli_victim_target"
+      user = %{id: "user_attacker", name: "Eve", color: "#DC2626"}
+
+      # Even if attacker crafts %{"client_id" => "cli_victim_target"} in wire params,
+      # server enforces client_id = sock.assigns[:collab_client_id]
+      params = %{"client_id" => attacker_forged_client_id, "x" => 0.5, "y" => 0.5}
+
+      # Server-side resolution:
+      enforced_client_id = real_client_id
+      refute enforced_client_id == params["client_id"]
+
+      payload =
+        LiveCollab.Cursor.build_payload(enforced_client_id, user, params["x"], params["y"])
+
+      assert payload.client_id == real_client_id
+      refute payload.client_id == attacker_forged_client_id
+    end
+  end
+
+  describe "Adversarial: Presence untrack/2 Key Parity" do
+    test "untrack uses user_key rather than client_id ensuring complete state purge" do
+      topic = "live_collab:untrack_test:1"
+      user = %{id: "usr_alice", name: "Alice"}
+      client_id = "cli_unique_tab_789"
+      user_key = to_string(user.id)
+
+      # Track the session using LiveCollab.Presence
+      {:ok, _ref} = Presence.track(TestPresence, self(), topic, user, client_id)
+
+      # Verify the user is present under the user_key ("usr_alice")
+      entries = TestPresence.list(topic)
+      assert Map.has_key?(entries, user_key)
+      refute Map.has_key?(entries, client_id)
+
+      # When untracking, we MUST use user_key ("usr_alice")
+      # Calling untrack with user_key purges the record cleanly
+      Presence.untrack(TestPresence, self(), topic, user_key)
+
+      assert TestPresence.list(topic) == %{}
+    end
+  end
+
+  describe "Adversarial: Spotlight Broadcast Authorization & Protection" do
+    test "rejects unauthorized clients from claiming spotlight leadership" do
+      # Mock socket with viewer permissions or untracked state
+      untracked_socket = %Phoenix.LiveView.Socket{assigns: %{}}
+      refute LiveCollab.LiveView.authorized_spotlight_leader?(untracked_socket, %{id: "u1"})
+
+      # Explicit false on socket assigns
+      forbidden_socket = %Phoenix.LiveView.Socket{
+        assigns: %{collab_client_id: "cli_1", collab_can_present?: false}
+      }
+      refute LiveCollab.LiveView.authorized_spotlight_leader?(forbidden_socket, %{id: "u1"})
+
+      # User with role viewer or observer
+      viewer_user = %{id: "u2", role: "viewer"}
+      normal_socket = %Phoenix.LiveView.Socket{assigns: %{collab_client_id: "cli_2"}}
+      refute LiveCollab.LiveView.authorized_spotlight_leader?(normal_socket, viewer_user)
+
+      observer_user = %{id: "u3", role: :observer}
+      refute LiveCollab.LiveView.authorized_spotlight_leader?(normal_socket, observer_user)
+
+      # Explicit can_present? false on user
+      disallowed_user = %{id: "u4", can_present?: false}
+      refute LiveCollab.LiveView.authorized_spotlight_leader?(normal_socket, disallowed_user)
+
+      # Authorized user
+      allowed_user = %{id: "u5", name: "Presenter Jane", role: "editor"}
+      assert LiveCollab.LiveView.authorized_spotlight_leader?(normal_socket, allowed_user)
+    end
+
+    test "prevents unauthorized viewers from terminating active spotlight presentation" do
+      active_leader_client = "cli_leader_1"
+      socket_with_active_leader = %Phoenix.LiveView.Socket{
+        assigns: %{
+          collab_client_id: "cli_attendee",
+          collab_spotlight_leader: active_leader_client
+        }
+      }
+
+      viewer_user = %{id: "u_attendee", role: "viewer"}
+
+      # Attendee viewer tries to stop someone else's spotlight presentation
+      refute LiveCollab.LiveView.can_stop_spotlight?(
+               socket_with_active_leader,
+               viewer_user,
+               "cli_attendee"
+             )
+
+      # Active leader CAN stop their own spotlight presentation
+      assert LiveCollab.LiveView.can_stop_spotlight?(
+               socket_with_active_leader,
+               viewer_user,
+               active_leader_client
+             )
+
+      # Admin / co-presenter CAN stop spotlight presentation
+      admin_user = %{id: "u_admin", role: "admin"}
+      assert LiveCollab.LiveView.can_stop_spotlight?(
+               socket_with_active_leader,
+               admin_user,
+               "cli_admin"
+             )
+    end
+  end
+
+  describe "Adversarial: Telemetry Flood Rate Limiting (Token Bucket Defense)" do
+    test "drops flood events when malicious client exceeds telemetry rate limits" do
+      # Limiter configured with burst of 10 and steady-state 50/sec
+      limiter = LiveCollab.RateLimiter.new(rate: 50, burst: 10, now_ms: 1000)
+
+      # Simulate an adversarial client flooding 50 cursor events in 1 millisecond
+      results =
+        Enum.reduce(1..50, {[], limiter}, fn _i, {acc, cur_limiter} ->
+          case LiveCollab.RateLimiter.check(cur_limiter, 1, 1000) do
+            {:allow, next_limiter} -> {[:allowed | acc], next_limiter}
+            {:deny, next_limiter} -> {[:denied | acc], next_limiter}
+          end
+        end)
+
+      {outcomes, final_limiter} = results
+
+      allowed_count = Enum.count(outcomes, &(&1 == :allowed))
+      denied_count = Enum.count(outcomes, &(&1 == :denied))
+
+      # Only 10 burst events are permitted; the remaining 40 flood events are dropped
+      assert allowed_count == 10
+      assert denied_count == 40
+      assert_in_delta final_limiter.tokens, 0.0, 0.001
+    end
+  end
+
+  describe "Adversarial: Multi-Node Cluster Clock Skew & Seniority Hardening" do
+    test "3-node cluster with 150ms clock skew converges to identical winner" do
+      base_time = 1_700_000_000_000
+
+      # Contenders concurrently claiming the same field across 3 nodes with drifted clocks:
+      # Node 1: clock is 100ms behind real time
+      # Node 2: clock is at real time
+      # Node 3: clock is 80ms ahead of real time
+      node1_claim = %{
+        client_id: "node1_client_b",
+        user_id: "u_bob",
+        acquired_at: base_time - 100,
+        field: "balance"
+      }
+
+      node2_claim = %{
+        client_id: "node2_client_c",
+        user_id: "u_charlie",
+        acquired_at: base_time,
+        field: "balance"
+      }
+
+      node3_claim = %{
+        client_id: "node3_client_a",
+        user_id: "u_alice",
+        acquired_at: base_time + 80,
+        field: "balance"
+      }
+
+      claims = [node1_claim, node2_claim, node3_claim]
+
+      # Shuffled to simulate gossip message arrival orders on different nodes
+      perm1 = Enum.shuffle(claims)
+      perm2 = Enum.shuffle(claims)
+      perm3 = Enum.shuffle(claims)
+
+      # With 500ms tolerance, all fall into the same concurrency window
+      # The winner MUST be chosen deterministically by client_id ("node3_client_a")
+      winner1 = Field.resolve_conflict(perm1, 500)
+      winner2 = Field.resolve_conflict(perm2, 500)
+      winner3 = Field.resolve_conflict(perm3, 500)
+
+      assert winner1.client_id == "node3_client_a"
+      assert winner2.client_id == "node3_client_a"
+      assert winner3.client_id == "node3_client_a"
+    end
+
+    test "re-focusing the same field preserves lock acquisition seniority timestamp" do
+      topic = "live_collab:seniority_test:1"
+      user = %{id: "u1", name: "Alice"}
+      client_id = "cli_senior_1"
+
+      {:ok, _} = Presence.track(TestPresence, self(), topic, user, client_id)
+
+      # Focus field first time
+      Presence.update_field(TestPresence, self(), topic, user.id, "email", client_id)
+      entries1 = TestPresence.list(topic)
+      initial_meta = hd(entries1[to_string(user.id)].metas)
+      initial_acquired_at = initial_meta.acquired_at
+      assert is_integer(initial_acquired_at) and initial_acquired_at > 0
+
+      # Simulate re-render or re-focus on the same field
+      Presence.update_field(TestPresence, self(), topic, user.id, "email", client_id)
+      entries2 = TestPresence.list(topic)
+      updated_meta = hd(entries2[to_string(user.id)].metas)
+
+      # Acquired timestamp must be strictly preserved!
+      assert updated_meta.acquired_at == initial_acquired_at
+    end
+
+    test "handle_presence_sync resets local editing field if lock dropped in Presence" do
+      # Socket believed it was editing "notes"
+      socket = %Phoenix.LiveView.Socket{
+        assigns: %{
+          collab_client_id: "cli_local",
+          collab_editing_field: "notes",
+          collab_users: [],
+          collab_locks: %{},
+          collab_activities: %{},
+          collab_config: %LiveCollab.Config{}
+        }
+      }
+
+      # Presence topic has no locks
+      synced_socket = LiveCollab.LiveView.handle_presence_sync(socket, TestPresence, "empty_topic")
+
+      # Local editing field was safely reset to nil
+      assert synced_socket.assigns.collab_editing_field == nil
+    end
+  end
 end

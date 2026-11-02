@@ -1,8 +1,8 @@
 defmodule LiveCollab.MixProject do
   use Mix.Project
 
-  @version "0.3.0"
-  @source_url "https://github.com/livecollab/live_collab"
+  @version "0.4.0"
+  @source_url "https://github.com/HataluliRandima/live_collab"
 
   def project do
     [

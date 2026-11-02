@@ -44,12 +44,25 @@ defmodule LiveCollab.FieldTest do
       assert Field.resolve_conflict([claim]) == claim
     end
 
-    test "earliest acquired_at timestamp wins" do
+    test "earliest acquired_at timestamp outside tolerance window wins" do
       early = %{client_id: "c_bob", user_id: "u_bob", acquired_at: 1000, field: "name"}
-      late = %{client_id: "c_alice", user_id: "u_alice", acquired_at: 1050, field: "name"}
+      late = %{client_id: "c_alice", user_id: "u_alice", acquired_at: 6000, field: "name"}
 
       assert Field.resolve_conflict([early, late]) == early
       assert Field.resolve_conflict([late, early]) == early
+    end
+
+    test "claims within clock skew tolerance window are resolved deterministically by client_id" do
+      # Two claims within 50ms of each other (within 500ms default tolerance window)
+      skewed_early = %{client_id: "c_bob", user_id: "u_bob", acquired_at: 1000, field: "name"}
+      skewed_late = %{client_id: "c_alice", user_id: "u_alice", acquired_at: 1050, field: "name"}
+
+      # Because "c_alice" < "c_bob", client_id tie-breaking breaks the tie without clock skew bias
+      assert Field.resolve_conflict([skewed_early, skewed_late]) == skewed_late
+      assert Field.resolve_conflict([skewed_late, skewed_early]) == skewed_late
+
+      # If tolerance is disabled (0 ms), raw earliest timestamp wins
+      assert Field.resolve_conflict([skewed_early, skewed_late], 0) == skewed_early
     end
 
     test "lexicographical client_id breaks simultaneous timestamp ties deterministically" do
