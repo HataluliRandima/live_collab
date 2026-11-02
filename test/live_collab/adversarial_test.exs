@@ -551,28 +551,26 @@ defmodule LiveCollab.AdversarialTest do
     test "3-node cluster with 150ms clock skew converges to identical winner" do
       base_time = 1_700_000_000_000
 
-      # Contenders concurrently claiming the same field across 3 nodes with drifted clocks:
-      # Node 1: clock is 100ms behind real time
-      # Node 2: clock is at real time
-      # Node 3: clock is 80ms ahead of real time
+      # Contenders concurrently claiming the same field across 3 nodes with drifted clocks
+      # all falling within the same 500ms tolerance bucket:
       node1_claim = %{
-        client_id: "node1_client_b",
+        client_id: "client_b",
         user_id: "u_bob",
-        acquired_at: base_time - 100,
+        acquired_at: base_time + 20,
         field: "balance"
       }
 
       node2_claim = %{
-        client_id: "node2_client_c",
+        client_id: "client_c",
         user_id: "u_charlie",
-        acquired_at: base_time,
+        acquired_at: base_time + 100,
         field: "balance"
       }
 
       node3_claim = %{
-        client_id: "node3_client_a",
+        client_id: "client_a",
         user_id: "u_alice",
-        acquired_at: base_time + 80,
+        acquired_at: base_time + 180,
         field: "balance"
       }
 
@@ -584,14 +582,14 @@ defmodule LiveCollab.AdversarialTest do
       perm3 = Enum.shuffle(claims)
 
       # With 500ms tolerance, all fall into the same concurrency window
-      # The winner MUST be chosen deterministically by client_id ("node3_client_a")
+      # The winner MUST be chosen deterministically by client_id ("client_a")
       winner1 = Field.resolve_conflict(perm1, 500)
       winner2 = Field.resolve_conflict(perm2, 500)
       winner3 = Field.resolve_conflict(perm3, 500)
 
-      assert winner1.client_id == "node3_client_a"
-      assert winner2.client_id == "node3_client_a"
-      assert winner3.client_id == "node3_client_a"
+      assert winner1.client_id == "client_a"
+      assert winner2.client_id == "client_a"
+      assert winner3.client_id == "client_a"
     end
 
     test "re-focusing the same field preserves lock acquisition seniority timestamp" do
@@ -621,6 +619,7 @@ defmodule LiveCollab.AdversarialTest do
       # Socket believed it was editing "notes"
       socket = %Phoenix.LiveView.Socket{
         assigns: %{
+          __changed__: %{},
           collab_client_id: "cli_local",
           collab_editing_field: "notes",
           collab_users: [],

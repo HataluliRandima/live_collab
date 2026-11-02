@@ -5,11 +5,11 @@ defmodule LiveCollab.CursorTest do
   describe "validate_coordinates/2" do
     test "accepts valid normalized float coordinates" do
       assert {:ok, 0.45, 0.88} = Cursor.validate_coordinates(0.45, 0.88)
-      assert {:ok, 0.0, 1.0} = Cursor.validate_coordinates(0.0, 1.0)
+      assert {:ok, +0.0, 1.0} = Cursor.validate_coordinates(0.0, 1.0)
     end
 
     test "accepts integers and converts to float" do
-      assert {:ok, 0.0, 1.0} = Cursor.validate_coordinates(0, 1)
+      assert {:ok, +0.0, 1.0} = Cursor.validate_coordinates(0, 1)
     end
 
     test "accepts valid string-encoded numbers" do

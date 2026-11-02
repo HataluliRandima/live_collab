@@ -1,0 +1,19 @@
+# Build and dependency directories
+/_build/
+/deps/
+/doc/
+*.beam
+
+# Language Server and IDEs
+/.elixir_ls/
+/.vscode/
+/.idea/
+
+# Environment files
+.env*
+
+# Node / JS
+/assets/node_modules/
+node_modules/
+npm-debug.log*
+yarn-error.log*

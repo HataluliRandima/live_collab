@@ -82,7 +82,6 @@ defmodule LiveCollab do
       })
   """
 
-  alias LiveCollab.Config
   alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.LiveView, as: LV

@@ -190,7 +190,7 @@ defmodule LiveCollab.Components do
   ## Examples
 
       <.row_indicator
-        element={"row:#{row.id}"}
+        element={"row:\#{row.id}"}
         activities={@collab_activities}
         current_client_id={@collab_client_id}
       />

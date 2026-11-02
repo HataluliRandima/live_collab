@@ -7,14 +7,23 @@ defmodule LiveCollab.TestSupport.TestPresence do
   use Agent
 
   def start_link(_opts \\ []) do
-    Agent.start_link(fn -> %{} end, name: __MODULE__)
+    Agent.start(fn -> %{} end, name: __MODULE__)
   end
 
   def reset! do
-    if Process.whereis(__MODULE__) do
-      Agent.update(__MODULE__, fn _ -> %{} end)
-    else
-      start_link()
+    case Process.whereis(__MODULE__) do
+      nil ->
+        Agent.start(fn -> %{} end, name: __MODULE__)
+        :ok
+
+      pid ->
+        try do
+          Agent.update(pid, fn _ -> %{} end)
+        catch
+          :exit, _ ->
+            Agent.start(fn -> %{} end, name: __MODULE__)
+            :ok
+        end
     end
   end
 
@@ -35,8 +44,6 @@ defmodule LiveCollab.TestSupport.TestPresence do
 
     # Monitor pid to clean up on process death (simulating Tracker)
     if is_pid(pid) do
-      caller = self()
-
       spawn(fn ->
         ref = Process.monitor(pid)
 
@@ -80,7 +87,14 @@ defmodule LiveCollab.TestSupport.TestPresence do
           state
 
         %{metas: [current | rest]} ->
-          updated_meta = update_fn.(current)
+          phx_ref = Map.get(current, :phx_ref)
+          updated_meta =
+            current
+            |> update_fn.()
+            |> then(fn m ->
+              if phx_ref, do: Map.put_new(m, :phx_ref, phx_ref), else: m
+            end)
+
           new_topic_map = Map.put(topic_map, key, %{metas: [updated_meta | rest]})
           Map.put(state, topic, new_topic_map)
 
@@ -123,8 +137,9 @@ defmodule LiveCollab.TestSupport.TestPresence do
   defp extract_pid(_), do: self()
 
   defp ensure_started do
-    unless Process.whereis(__MODULE__) do
-      start_link()
+    case Process.whereis(__MODULE__) do
+      nil -> Agent.start(fn -> %{} end, name: __MODULE__)
+      _ -> :ok
     end
   end
 end

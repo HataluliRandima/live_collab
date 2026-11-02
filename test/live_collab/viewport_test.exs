@@ -5,7 +5,7 @@ defmodule LiveCollab.ViewportTest do
   describe "validate_viewport/3" do
     test "accepts valid normalized scroll percentages and zoom" do
       assert {:ok, 0.5, 0.8, 1.0} = Viewport.validate_viewport(0.5, 0.8)
-      assert {:ok, 0.0, 1.0, 1.5} = Viewport.validate_viewport(0, 1, 1.5)
+      assert {:ok, +0.0, 1.0, 1.5} = Viewport.validate_viewport(0, 1, 1.5)
       assert {:ok, 0.25, 0.75, 2.0} = Viewport.validate_viewport("0.25", "0.75", "2.0")
     end
 
@@ -33,7 +33,7 @@ defmodule LiveCollab.ViewportTest do
   describe "validate_selection/4" do
     test "accepts valid bounding boxes" do
       assert {:ok, 0.1, 0.2, 0.5, 0.4} = Viewport.validate_selection(0.1, 0.2, 0.5, 0.4)
-      assert {:ok, 0.0, 0.0, 1.0, 1.0} = Viewport.validate_selection(0, 0, 1, 1)
+      assert {:ok, +0.0, +0.0, 1.0, 1.0} = Viewport.validate_selection(0, 0, 1, 1)
       assert {:ok, 0.2, 0.3, 0.4, 0.5} = Viewport.validate_selection("0.2", "0.3", "0.4", "0.5")
     end
 

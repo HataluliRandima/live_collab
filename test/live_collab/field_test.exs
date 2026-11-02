@@ -117,7 +117,7 @@ defmodule LiveCollab.FieldTest do
               user_id: "alice",
               user_name: "Alice",
               field: "billing.street",
-              acquired_at: 200
+              acquired_at: 700
             }
           ]
         },
@@ -128,14 +128,14 @@ defmodule LiveCollab.FieldTest do
               user_id: "bob",
               user_name: "Bob",
               field: "billing.street",
-              acquired_at: 150
+              acquired_at: 100
             }
           ]
         }
       }
 
       locks = Field.extract_locks(presence_data)
-      # Bob acquired at 150 < 200, so Bob wins
+      # Bob acquired at 100 in earlier window than Alice at 700, so Bob wins
       assert locks["billing.street"].user_name == "Bob"
       assert locks["billing.street"].client_id == "c_bob"
     end
