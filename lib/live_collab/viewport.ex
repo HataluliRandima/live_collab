@@ -129,6 +129,24 @@ defmodule LiveCollab.Viewport do
     }
   end
 
+  @max_selected_ids 100
+  @max_selected_id_length 255
+
+  @doc """
+  Sanitizes and bounds an array of selected element or node IDs.
+  Limits length to at most 100 items, and truncates each ID string to at most 255 bytes.
+  Non-binary elements are discarded.
+  """
+  @spec sanitize_selected_ids(term()) :: [String.t()]
+  def sanitize_selected_ids(selected_ids) when is_list(selected_ids) do
+    selected_ids
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.slice(&1, 0, @max_selected_id_length))
+    |> Enum.take(@max_selected_ids)
+  end
+
+  def sanitize_selected_ids(_), do: []
+
   @doc """
   Sanitizes and constructs a broadcast selection bounding box payload.
   """
@@ -150,7 +168,8 @@ defmodule LiveCollab.Viewport do
         LiveCollab.Presence.deterministic_color(user_id)
 
     container_id = Keyword.get(opts, :container_id)
-    selected_ids = Keyword.get(opts, :selected_ids, [])
+    raw_selected_ids = Keyword.get(opts, :selected_ids, [])
+    selected_ids = sanitize_selected_ids(raw_selected_ids)
 
     %{
       client_id: client_id,

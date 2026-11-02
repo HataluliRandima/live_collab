@@ -77,6 +77,19 @@ defmodule LiveCollab.Presence do
   end
 
   @doc """
+  Untracks a process or socket from the collaborative presence topic.
+  """
+  @spec untrack(
+          presence_module :: module(),
+          pid_or_socket :: pid() | Phoenix.LiveView.Socket.t(),
+          topic :: String.t(),
+          user_id :: term()
+        ) :: :ok | {:ok, binary()} | {:error, term()}
+  def untrack(presence_module, pid_or_socket, topic, user_id) do
+    presence_module.untrack(pid_or_socket, topic, to_string(user_id))
+  end
+
+  @doc """
   Updates the field currently locked by this client in the presence topic.
   """
   @spec update_field(

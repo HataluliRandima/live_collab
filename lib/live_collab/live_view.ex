@@ -51,6 +51,8 @@ defmodule LiveCollab.LiveView do
 
     # Each browser tab or client instance generates or is assigned a unique client_id
     client_id = Keyword.get(opts, :client_id, generate_client_id())
+    user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
+    user_key = to_string(user_id)
 
     # Only track if socket is connected to avoid tracking static HTTP pre-renders
     socket =
@@ -63,7 +65,7 @@ defmodule LiveCollab.LiveView do
 
         # Attach LiveView lifecycle hooks for clean, zero-boilerplate event handling
         socket
-        |> attach_collab_event_hook(config, presence_mod, topic, user)
+        |> attach_collab_event_hook(config, presence_mod, user)
         |> attach_collab_info_hook(config, presence_mod, topic)
       else
         socket
@@ -81,10 +83,12 @@ defmodule LiveCollab.LiveView do
     |> assign(:collab_topic, topic)
     |> assign(:collab_pubsub, pubsub_server)
     |> assign(:collab_client_id, client_id)
+    |> assign(:collab_user_key, user_key)
     |> assign(:collab_users, users)
     |> assign(:collab_locks, locks)
     |> assign(:collab_activities, activities)
     |> assign(:collab_active_element, nil)
+    |> assign(:collab_spotlight_leader, nil)
     |> assign(:collab_config, config)
   end
 
@@ -101,16 +105,22 @@ defmodule LiveCollab.LiveView do
       pubsub_server =
         socket.assigns[:collab_pubsub] || config.pubsub || default_pubsub_server(presence_mod)
 
+      user_key =
+        socket.assigns[:collab_user_key] ||
+          to_string(socket.assigns[:collab_client_id])
+
       Phoenix.PubSub.unsubscribe(pubsub_server, topic)
-      presence_mod.untrack(socket, topic, to_string(socket.assigns[:collab_client_id]))
+      Presence.untrack(presence_mod, socket, topic, user_key)
     end
 
     socket
     |> assign(:collab_topic, nil)
+    |> assign(:collab_user_key, nil)
     |> assign(:collab_users, [])
     |> assign(:collab_locks, %{})
     |> assign(:collab_activities, %{})
     |> assign(:collab_active_element, nil)
+    |> assign(:collab_spotlight_leader, nil)
   end
 
   @doc """
@@ -165,200 +175,323 @@ defmodule LiveCollab.LiveView do
   end
 
   # ============================================================================
+  # Authorization & Security Helpers
+  # ============================================================================
+
+  @doc """
+  Determines if a given socket/user is authorized to lead a spotlight broadcast.
+  Rejects unauthenticated clients, explicit false flags, and viewer/observer roles.
+  """
+  @spec authorized_spotlight_leader?(Phoenix.LiveView.Socket.t(), map()) :: boolean()
+  def authorized_spotlight_leader?(socket, user) do
+    cond do
+      is_nil(socket.assigns[:collab_client_id]) ->
+        false
+
+      Map.get(socket.assigns, :collab_can_present?) == false ->
+        false
+
+      Map.get(socket.assigns, :can_present?) == false ->
+        false
+
+      Map.get(user, :can_present?) == false ->
+        false
+
+      Map.get(user, "can_present") == false ->
+        false
+
+      Map.get(user, :role) in [:viewer, "viewer", :observer, "observer"] ->
+        false
+
+      Map.get(user, "role") in ["viewer", "observer"] ->
+        false
+
+      true ->
+        true
+    end
+  end
+
+  @doc """
+  Determines if a given client/user is authorized to stop an active spotlight.
+  The current spotlight leader or any authorized presenter is permitted to stop it.
+  """
+  @spec can_stop_spotlight?(Phoenix.LiveView.Socket.t(), map(), String.t() | nil) :: boolean()
+  def can_stop_spotlight?(socket, user, client_id) do
+    current_leader = socket.assigns[:collab_spotlight_leader]
+
+    cond do
+      is_nil(client_id) ->
+        false
+
+      is_nil(current_leader) or current_leader == client_id ->
+        true
+
+      authorized_spotlight_leader?(socket, user) ->
+        true
+
+      true ->
+        false
+    end
+  end
+
+  # ============================================================================
   # Internal Lifecycle Hooks
   # ============================================================================
 
   defp attach_collab_event_hook(socket, config, presence_mod, user) do
     attach_hook(socket, :live_collab_events, :handle_event, fn
-      "live_collab:field_focus", %{"field" => raw_field} = params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+      "live_collab:field_focus", %{"field" => raw_field}, sock ->
+        client_id = sock.assigns[:collab_client_id]
 
-        case Field.validate_field_id(raw_field, config.max_field_id_length) do
-          {:ok, field_id} ->
-            topic = sock.assigns.collab_topic
-            user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          case Field.validate_field_id(raw_field, config.max_field_id_length) do
+            {:ok, field_id} ->
+              topic = sock.assigns.collab_topic
 
-            # Atomic update in Presence
-            Presence.update_field(presence_mod, sock, topic, user_id, field_id, client_id)
+              user_key =
+                sock.assigns[:collab_user_key] ||
+                  to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
 
-            {:halt, assign(sock, :collab_editing_field, field_id)}
+              # Atomic update in Presence
+              Presence.update_field(presence_mod, sock, topic, user_key, field_id, client_id)
 
-          {:error, _reason} ->
-            {:halt, sock}
+              {:halt, assign(sock, :collab_editing_field, field_id)}
+
+            {:error, _reason} ->
+              {:halt, sock}
+          end
         end
 
-      "live_collab:field_blur", params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
-        topic = sock.assigns.collab_topic
-        user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
+      "live_collab:field_blur", _params, sock ->
+        client_id = sock.assigns[:collab_client_id]
 
-        Presence.clear_field(presence_mod, sock, topic, user_id, client_id)
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          topic = sock.assigns.collab_topic
 
-        {:halt, assign(sock, :collab_editing_field, nil)}
+          user_key =
+            sock.assigns[:collab_user_key] ||
+              to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
+
+          Presence.clear_field(presence_mod, sock, topic, user_key, client_id)
+
+          {:halt, assign(sock, :collab_editing_field, nil)}
+        end
 
       "live_collab:element_active", %{"element" => raw_element} = params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+        client_id = sock.assigns[:collab_client_id]
 
-        case Element.validate_element_id(raw_element, config.max_field_id_length) do
-          {:ok, element_id} ->
-            type = Element.normalize_activity_type(params["type"])
-            topic = sock.assigns.collab_topic
-            user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          case Element.validate_element_id(raw_element, config.max_field_id_length) do
+            {:ok, element_id} ->
+              type = Element.normalize_activity_type(params["type"])
+              topic = sock.assigns.collab_topic
 
-            Presence.update_element(
-              presence_mod,
-              sock,
-              topic,
-              user_id,
-              element_id,
-              type,
-              client_id
-            )
+              user_key =
+                sock.assigns[:collab_user_key] ||
+                  to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
 
-            {:halt, assign(sock, :collab_active_element, element_id)}
+              Presence.update_element(
+                presence_mod,
+                sock,
+                topic,
+                user_key,
+                element_id,
+                type,
+                client_id
+              )
 
-          {:error, _reason} ->
-            {:halt, sock}
+              {:halt, assign(sock, :collab_active_element, element_id)}
+
+            {:error, _reason} ->
+              {:halt, sock}
+          end
         end
 
-      "live_collab:element_inactive", params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
-        topic = sock.assigns.collab_topic
-        user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
+      "live_collab:element_inactive", _params, sock ->
+        client_id = sock.assigns[:collab_client_id]
 
-        Presence.clear_element(presence_mod, sock, topic, user_id, client_id)
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          topic = sock.assigns.collab_topic
 
-        {:halt, assign(sock, :collab_active_element, nil)}
+          user_key =
+            sock.assigns[:collab_user_key] ||
+              to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
+
+          Presence.clear_element(presence_mod, sock, topic, user_key, client_id)
+
+          {:halt, assign(sock, :collab_active_element, nil)}
+        end
 
       # High-Frequency Ephemeral Cursor Telemetry (Path 2: Zero Assigns Diffing)
       "live_collab:cursor_move", %{"x" => x, "y" => y} = params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+        client_id = sock.assigns[:collab_client_id]
 
-        case Cursor.validate_coordinates(x, y) do
-          {:ok, nx, ny} ->
-            topic = sock.assigns.collab_topic
-            pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
-            container_id = params["container_id"]
-            payload = Cursor.build_payload(client_id, user, nx, ny, container_id)
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          case Cursor.validate_coordinates(x, y) do
+            {:ok, nx, ny} ->
+              topic = sock.assigns.collab_topic
+              pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+              container_id = params["container_id"]
+              payload = Cursor.build_payload(client_id, user, nx, ny, container_id)
 
-            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
-            {:halt, sock}
+              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
+              {:halt, sock}
 
-          {:error, _reason} ->
-            {:halt, sock}
+            {:error, _reason} ->
+              {:halt, sock}
+          end
         end
 
       "live_collab:cursor_left", params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
-        topic = sock.assigns.collab_topic
-        pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
-        container_id = params["container_id"]
+        client_id = sock.assigns[:collab_client_id]
 
-        Phoenix.PubSub.broadcast(
-          pubsub,
-          topic,
-          {:collab_cursor_left, topic,
-           %{client_id: client_id, container_id: container_id}}
-        )
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          topic = sock.assigns.collab_topic
+          pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+          container_id = params["container_id"]
 
-        {:halt, sock}
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_cursor_left, topic,
+             %{client_id: client_id, container_id: container_id}}
+          )
+
+          {:halt, sock}
+        end
 
       # High-Frequency Viewport & Scroll Following (Path 2)
       "live_collab:viewport_move",
       %{"scroll_x" => sx, "scroll_y" => sy} = params,
       sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
-        zoom = params["zoom"] || 1.0
+        client_id = sock.assigns[:collab_client_id]
 
-        case Viewport.validate_viewport(sx, sy, zoom) do
-          {:ok, nsx, nsy, nzoom} ->
-            topic = sock.assigns.collab_topic
-            pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          zoom = params["zoom"] || 1.0
 
-            payload =
-              Viewport.build_viewport_payload(client_id, user, nsx, nsy,
-                zoom: nzoom,
-                container_id: params["container_id"],
-                anchor_element_id: params["anchor_element_id"]
-              )
+          case Viewport.validate_viewport(sx, sy, zoom) do
+            {:ok, nsx, nsy, nzoom} ->
+              topic = sock.assigns.collab_topic
+              pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
 
-            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
-            {:halt, sock}
+              payload =
+                Viewport.build_viewport_payload(client_id, user, nsx, nsy,
+                  zoom: nzoom,
+                  container_id: params["container_id"],
+                  anchor_element_id: params["anchor_element_id"]
+                )
 
-          {:error, _reason} ->
-            {:halt, sock}
+              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
+              {:halt, sock}
+
+            {:error, _reason} ->
+              {:halt, sock}
+          end
         end
 
-      "live_collab:spotlight_lead", params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
-        topic = sock.assigns.collab_topic
-        pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
-        user_name = Map.get(user, :name) || Map.get(user, "name") || "Leader"
+      "live_collab:spotlight_lead", _params, sock ->
+        client_id = sock.assigns[:collab_client_id]
 
-        Phoenix.PubSub.broadcast(
-          pubsub,
-          topic,
-          {:collab_spotlight_status, topic,
-           %{
-             client_id: client_id,
-             user_id: Map.get(user, :id) || client_id,
-             user_name: user_name,
-             active: true
-           }}
-        )
+        if is_nil(client_id) or not authorized_spotlight_leader?(sock, user) do
+          {:halt, push_event(sock, "live_collab:spotlight_unauthorized", %{reason: "unauthorized"})}
+        else
+          topic = sock.assigns.collab_topic
+          pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+          user_name = Map.get(user, :name) || Map.get(user, "name") || "Leader"
 
-        {:halt, sock}
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_spotlight_status, topic,
+             %{
+               client_id: client_id,
+               user_id: Map.get(user, :id) || client_id,
+               user_name: user_name,
+               active: true
+             }}
+          )
 
-      "live_collab:spotlight_stop", params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
-        topic = sock.assigns.collab_topic
-        pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+          {:halt, assign(sock, :collab_spotlight_leader, client_id)}
+        end
 
-        Phoenix.PubSub.broadcast(
-          pubsub,
-          topic,
-          {:collab_spotlight_status, topic, %{client_id: client_id, active: false}}
-        )
+      "live_collab:spotlight_stop", _params, sock ->
+        client_id = sock.assigns[:collab_client_id]
 
-        {:halt, sock}
+        if is_nil(client_id) or not can_stop_spotlight?(sock, user, client_id) do
+          {:halt, sock}
+        else
+          topic = sock.assigns.collab_topic
+          pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_spotlight_status, topic, %{client_id: client_id, active: false}}
+          )
+
+          {:halt, assign(sock, :collab_spotlight_leader, nil)}
+        end
 
       # Multiplayer Selection Bounding Boxes (Path 2)
       "live_collab:selection_move",
       %{"x" => x, "y" => y, "width" => w, "height" => h} = params,
       sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+        client_id = sock.assigns[:collab_client_id]
 
-        case Viewport.validate_selection(x, y, w, h) do
-          {:ok, nx, ny, nw, nh} ->
-            topic = sock.assigns.collab_topic
-            pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          case Viewport.validate_selection(x, y, w, h) do
+            {:ok, nx, ny, nw, nh} ->
+              topic = sock.assigns.collab_topic
+              pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
 
-            payload =
-              Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
-                container_id: params["container_id"],
-                selected_ids: params["selected_ids"] || []
-              )
+              payload =
+                Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
+                  container_id: params["container_id"],
+                  selected_ids: params["selected_ids"] || []
+                )
 
-            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
-            {:halt, sock}
+              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
+              {:halt, sock}
 
-          {:error, _reason} ->
-            {:halt, sock}
+            {:error, _reason} ->
+              {:halt, sock}
+          end
         end
 
       "live_collab:selection_clear", params, sock ->
-        client_id = params["client_id"] || sock.assigns[:collab_client_id]
-        topic = sock.assigns.collab_topic
-        pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
+        client_id = sock.assigns[:collab_client_id]
 
-        Phoenix.PubSub.broadcast(
-          pubsub,
-          topic,
-          {:collab_selection_cleared, topic,
-           %{client_id: client_id, container_id: params["container_id"]}}
-        )
+        if is_nil(client_id) do
+          {:halt, sock}
+        else
+          topic = sock.assigns.collab_topic
+          pubsub = sock.assigns[:collab_pubsub] || default_pubsub_server(presence_mod)
 
-        {:halt, sock}
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_selection_cleared, topic,
+             %{client_id: client_id, container_id: params["container_id"]}}
+          )
+
+          {:halt, sock}
+        end
 
       _other_event, _params, sock ->
         {:cont, sock}
@@ -393,6 +526,9 @@ defmodule LiveCollab.LiveView do
         end
 
       {:collab_spotlight_status, ^topic, payload}, sock ->
+        leader = if payload[:active], do: payload[:client_id], else: nil
+        sock = assign(sock, :collab_spotlight_leader, leader)
+
         if payload[:client_id] != sock.assigns[:collab_client_id] do
           {:halt, push_event(sock, "live_collab:spotlight_status", payload)}
         else
@@ -451,129 +587,171 @@ defmodule LiveCollab.LiveView do
     quote do
       import LiveCollab.Components
 
-      def handle_event("live_collab:field_focus", %{"field" => field} = params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        presence_mod = config.presence
-        topic = socket.assigns.collab_topic
-        user = socket.assigns[:current_user] || %{}
-        user_id = Map.get(user, :id) || client_id
+      def handle_event("live_collab:field_focus", %{"field" => field}, socket) do
+        client_id = socket.assigns[:collab_client_id]
 
-        case LiveCollab.Field.validate_field_id(field, config.max_field_id_length) do
-          {:ok, field_id} ->
-            LiveCollab.Presence.update_field(
-              presence_mod,
-              socket,
-              topic,
-              user_id,
-              field_id,
-              client_id
-            )
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          presence_mod = config.presence
+          topic = socket.assigns.collab_topic
+          user = socket.assigns[:current_user] || %{}
 
-            {:noreply, assign(socket, :collab_editing_field, field_id)}
+          user_key =
+            socket.assigns[:collab_user_key] ||
+              to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
 
-          {:error, _} ->
-            {:noreply, socket}
+          case LiveCollab.Field.validate_field_id(field, config.max_field_id_length) do
+            {:ok, field_id} ->
+              LiveCollab.Presence.update_field(
+                presence_mod,
+                socket,
+                topic,
+                user_key,
+                field_id,
+                client_id
+              )
+
+              {:noreply, assign(socket, :collab_editing_field, field_id)}
+
+            {:error, _} ->
+              {:noreply, socket}
+          end
         end
       end
 
-      def handle_event("live_collab:field_blur", params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        presence_mod = config.presence
-        topic = socket.assigns.collab_topic
-        user = socket.assigns[:current_user] || %{}
-        user_id = Map.get(user, :id) || client_id
+      def handle_event("live_collab:field_blur", _params, socket) do
+        client_id = socket.assigns[:collab_client_id]
 
-        LiveCollab.Presence.clear_field(presence_mod, socket, topic, user_id, client_id)
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          presence_mod = config.presence
+          topic = socket.assigns.collab_topic
+          user = socket.assigns[:current_user] || %{}
 
-        {:noreply, assign(socket, :collab_editing_field, nil)}
+          user_key =
+            socket.assigns[:collab_user_key] ||
+              to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
+
+          LiveCollab.Presence.clear_field(presence_mod, socket, topic, user_key, client_id)
+
+          {:noreply, assign(socket, :collab_editing_field, nil)}
+        end
       end
 
       def handle_event("live_collab:element_active", %{"element" => element} = params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        presence_mod = config.presence
-        topic = socket.assigns.collab_topic
-        user = socket.assigns[:current_user] || %{}
-        user_id = Map.get(user, :id) || client_id
+        client_id = socket.assigns[:collab_client_id]
 
-        case LiveCollab.Element.validate_element_id(element, config.max_field_id_length) do
-          {:ok, element_id} ->
-            type = LiveCollab.Element.normalize_activity_type(params["type"])
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          presence_mod = config.presence
+          topic = socket.assigns.collab_topic
+          user = socket.assigns[:current_user] || %{}
 
-            LiveCollab.Presence.update_element(
-              presence_mod,
-              socket,
-              topic,
-              user_id,
-              element_id,
-              type,
-              client_id
-            )
+          user_key =
+            socket.assigns[:collab_user_key] ||
+              to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
 
-            {:noreply, assign(socket, :collab_active_element, element_id)}
+          case LiveCollab.Element.validate_element_id(element, config.max_field_id_length) do
+            {:ok, element_id} ->
+              type = LiveCollab.Element.normalize_activity_type(params["type"])
 
-          {:error, _} ->
-            {:noreply, socket}
+              LiveCollab.Presence.update_element(
+                presence_mod,
+                socket,
+                topic,
+                user_key,
+                element_id,
+                type,
+                client_id
+              )
+
+              {:noreply, assign(socket, :collab_active_element, element_id)}
+
+            {:error, _} ->
+              {:noreply, socket}
+          end
         end
       end
 
-      def handle_event("live_collab:element_inactive", params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        presence_mod = config.presence
-        topic = socket.assigns.collab_topic
-        user = socket.assigns[:current_user] || %{}
-        user_id = Map.get(user, :id) || client_id
+      def handle_event("live_collab:element_inactive", _params, socket) do
+        client_id = socket.assigns[:collab_client_id]
 
-        LiveCollab.Presence.clear_element(presence_mod, socket, topic, user_id, client_id)
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          presence_mod = config.presence
+          topic = socket.assigns.collab_topic
+          user = socket.assigns[:current_user] || %{}
 
-        {:noreply, assign(socket, :collab_active_element, nil)}
+          user_key =
+            socket.assigns[:collab_user_key] ||
+              to_string(Map.get(user, :id) || Map.get(user, "id") || client_id)
+
+          LiveCollab.Presence.clear_element(presence_mod, socket, topic, user_key, client_id)
+
+          {:noreply, assign(socket, :collab_active_element, nil)}
+        end
       end
 
       def handle_event("live_collab:cursor_move", %{"x" => x, "y" => y} = params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        user = socket.assigns[:current_user] || %{}
+        client_id = socket.assigns[:collab_client_id]
 
-        case LiveCollab.Cursor.validate_coordinates(x, y) do
-          {:ok, nx, ny} ->
-            topic = socket.assigns.collab_topic
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          user = socket.assigns[:current_user] || %{}
 
-            pubsub =
-              socket.assigns[:collab_pubsub] || config.pubsub ||
-                LiveCollab.LiveView.default_pubsub_server(config.presence)
+          case LiveCollab.Cursor.validate_coordinates(x, y) do
+            {:ok, nx, ny} ->
+              topic = socket.assigns.collab_topic
 
-            container_id = params["container_id"]
-            payload = LiveCollab.Cursor.build_payload(client_id, user, nx, ny, container_id)
+              pubsub =
+                socket.assigns[:collab_pubsub] || config.pubsub ||
+                  LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
-            {:noreply, socket}
+              container_id = params["container_id"]
+              payload = LiveCollab.Cursor.build_payload(client_id, user, nx, ny, container_id)
 
-          {:error, _} ->
-            {:noreply, socket}
+              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_cursor_moved, topic, payload})
+              {:noreply, socket}
+
+            {:error, _} ->
+              {:noreply, socket}
+          end
         end
       end
 
       def handle_event("live_collab:cursor_left", params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        topic = socket.assigns.collab_topic
+        client_id = socket.assigns[:collab_client_id]
 
-        pubsub =
-          socket.assigns[:collab_pubsub] || config.pubsub ||
-            LiveCollab.LiveView.default_pubsub_server(config.presence)
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          topic = socket.assigns.collab_topic
 
-        container_id = params["container_id"]
+          pubsub =
+            socket.assigns[:collab_pubsub] || config.pubsub ||
+              LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-        Phoenix.PubSub.broadcast(
-          pubsub,
-          topic,
-          {:collab_cursor_left, topic, %{client_id: client_id, container_id: container_id}}
-        )
+          container_id = params["container_id"]
 
-        {:noreply, socket}
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_cursor_left, topic, %{client_id: client_id, container_id: container_id}}
+          )
+
+          {:noreply, socket}
+        end
       end
 
       def handle_event(
@@ -581,83 +759,153 @@ defmodule LiveCollab.LiveView do
             %{"scroll_x" => sx, "scroll_y" => sy} = params,
             socket
           ) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        user = socket.assigns[:current_user] || %{}
-        zoom = params["zoom"] || 1.0
+        client_id = socket.assigns[:collab_client_id]
 
-        case LiveCollab.Viewport.validate_viewport(sx, sy, zoom) do
-          {:ok, nsx, nsy, nzoom} ->
-            topic = socket.assigns.collab_topic
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          user = socket.assigns[:current_user] || %{}
+          zoom = params["zoom"] || 1.0
 
-            pubsub =
-              socket.assigns[:collab_pubsub] || config.pubsub ||
-                LiveCollab.LiveView.default_pubsub_server(config.presence)
+          case LiveCollab.Viewport.validate_viewport(sx, sy, zoom) do
+            {:ok, nsx, nsy, nzoom} ->
+              topic = socket.assigns.collab_topic
 
-            payload =
-              LiveCollab.Viewport.build_viewport_payload(client_id, user, nsx, nsy,
-                zoom: nzoom,
-                container_id: params["container_id"],
-                anchor_element_id: params["anchor_element_id"]
-              )
+              pubsub =
+                socket.assigns[:collab_pubsub] || config.pubsub ||
+                  LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
-            {:noreply, socket}
+              payload =
+                LiveCollab.Viewport.build_viewport_payload(client_id, user, nsx, nsy,
+                  zoom: nzoom,
+                  container_id: params["container_id"],
+                  anchor_element_id: params["anchor_element_id"]
+                )
 
-          {:error, _} ->
-            {:noreply, socket}
+              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_viewport_moved, topic, payload})
+              {:noreply, socket}
+
+            {:error, _} ->
+              {:noreply, socket}
+          end
         end
       end
 
-      def handle_event("live_collab:selection_move", params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+      def handle_event("live_collab:spotlight_lead", _params, socket) do
+        client_id = socket.assigns[:collab_client_id]
         user = socket.assigns[:current_user] || %{}
 
-        case LiveCollab.Viewport.validate_selection(
-               params["x"],
-               params["y"],
-               params["width"],
-               params["height"]
-             ) do
-          {:ok, nx, ny, nw, nh} ->
-            topic = socket.assigns.collab_topic
+        if is_nil(client_id) or not LiveCollab.LiveView.authorized_spotlight_leader?(socket, user) do
+          {:noreply, push_event(socket, "live_collab:spotlight_unauthorized", %{reason: "unauthorized"})}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          topic = socket.assigns.collab_topic
 
-            pubsub =
-              socket.assigns[:collab_pubsub] || config.pubsub ||
-                LiveCollab.LiveView.default_pubsub_server(config.presence)
+          pubsub =
+            socket.assigns[:collab_pubsub] || config.pubsub ||
+              LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-            payload =
-              LiveCollab.Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
-                container_id: params["container_id"],
-                selected_ids: params["selected_ids"] || []
-              )
+          user_name = Map.get(user, :name) || Map.get(user, "name") || "Leader"
 
-            Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
-            {:noreply, socket}
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_spotlight_status, topic,
+             %{
+               client_id: client_id,
+               user_id: Map.get(user, :id) || client_id,
+               user_name: user_name,
+               active: true
+             }}
+          )
 
-          {:error, _} ->
-            {:noreply, socket}
+          {:noreply, assign(socket, :collab_spotlight_leader, client_id)}
+        end
+      end
+
+      def handle_event("live_collab:spotlight_stop", _params, socket) do
+        client_id = socket.assigns[:collab_client_id]
+        user = socket.assigns[:current_user] || %{}
+
+        if is_nil(client_id) or not LiveCollab.LiveView.can_stop_spotlight?(socket, user, client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          topic = socket.assigns.collab_topic
+
+          pubsub =
+            socket.assigns[:collab_pubsub] || config.pubsub ||
+              LiveCollab.LiveView.default_pubsub_server(config.presence)
+
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_spotlight_status, topic, %{client_id: client_id, active: false}}
+          )
+
+          {:noreply, assign(socket, :collab_spotlight_leader, nil)}
+        end
+      end
+
+      def handle_event(
+            "live_collab:selection_move",
+            %{"x" => x, "y" => y, "width" => w, "height" => h} = params,
+            socket
+          ) do
+        client_id = socket.assigns[:collab_client_id]
+
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          user = socket.assigns[:current_user] || %{}
+
+          case LiveCollab.Viewport.validate_selection(x, y, w, h) do
+            {:ok, nx, ny, nw, nh} ->
+              topic = socket.assigns.collab_topic
+
+              pubsub =
+                socket.assigns[:collab_pubsub] || config.pubsub ||
+                  LiveCollab.LiveView.default_pubsub_server(config.presence)
+
+              payload =
+                LiveCollab.Viewport.build_selection_payload(client_id, user, nx, ny, nw, nh,
+                  container_id: params["container_id"],
+                  selected_ids: params["selected_ids"] || []
+                )
+
+              Phoenix.PubSub.broadcast(pubsub, topic, {:collab_selection_moved, topic, payload})
+              {:noreply, socket}
+
+            {:error, _} ->
+              {:noreply, socket}
+          end
         end
       end
 
       def handle_event("live_collab:selection_clear", params, socket) do
-        client_id = params["client_id"] || socket.assigns[:collab_client_id]
-        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
-        topic = socket.assigns.collab_topic
+        client_id = socket.assigns[:collab_client_id]
 
-        pubsub =
-          socket.assigns[:collab_pubsub] || config.pubsub ||
-            LiveCollab.LiveView.default_pubsub_server(config.presence)
+        if is_nil(client_id) do
+          {:noreply, socket}
+        else
+          config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+          topic = socket.assigns.collab_topic
 
-        Phoenix.PubSub.broadcast(
-          pubsub,
-          topic,
-          {:collab_selection_cleared, topic,
-           %{client_id: client_id, container_id: params["container_id"]}}
-        )
+          pubsub =
+            socket.assigns[:collab_pubsub] || config.pubsub ||
+              LiveCollab.LiveView.default_pubsub_server(config.presence)
 
-        {:noreply, socket}
+          Phoenix.PubSub.broadcast(
+            pubsub,
+            topic,
+            {:collab_selection_cleared, topic,
+             %{client_id: client_id, container_id: params["container_id"]}}
+          )
+
+          {:noreply, socket}
+        end
       end
 
       def handle_info(
@@ -701,6 +949,9 @@ defmodule LiveCollab.LiveView do
 
       def handle_info({:collab_spotlight_status, topic, payload}, socket)
           when topic == socket.assigns.collab_topic do
+        leader = if payload[:active], do: payload[:client_id], else: nil
+        socket = assign(socket, :collab_spotlight_leader, leader)
+
         if payload[:client_id] != socket.assigns[:collab_client_id] do
           {:noreply, push_event(socket, "live_collab:spotlight_status", payload)}
         else
