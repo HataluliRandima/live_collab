@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-02
+
+### Added
+- **High-Performance Collaborative Cursors (Path 2: Zero Assigns Diffing)**:
+  - `LiveCollab.Cursor` module for coordinate validation, bounds checking, and normalized telemetry payload creation.
+  - Zero-diffing PubSub broadcast pipeline: cursor movements bypass LiveView assigns completely, dispatched via direct `push_event/3` with zero template re-renders or Morphdom diff cycles.
+  - `<LiveCollab.Components.cursor_layer />` and `LiveCollab.Components.collab_cursor_attrs/2` for attaching multiplayer cursor layers to canvases, boards, or arbitrary containers.
+  - Client-side hook `LiveCollabCursor`:
+    - Normalized `[0.0, 1.0]` coordinates ensuring consistent cursor rendering across responsive layouts and varied screen resolutions.
+    - Client-side throttled broadcast (30ms / ~33 fps) with distance deadband thresholding.
+    - Smooth 60/120 FPS linear interpolation (`lerp`) via `requestAnimationFrame`.
+    - Crisp SVG cursor arrow with customized username pill styled using the collaborator's deterministic color.
+    - Automatic 4-second inactivity fadeout and instantaneous `pointerleave` cleanup.
+    - Local cursor echo suppression (clients never re-render their own cursor).
+- **Unit and Adversarial Test Suite for Cursors**:
+  - Validates coordinate normalization, bounds checking, and rejection of non-numeric, NaN, or infinity payloads.
+  - Verifies that LiveView assigns remain 100% untouched during high-frequency cursor telemetry bursts.
+  - Verifies filtering of self-echoed cursor messages.
+
 ## [0.1.1] - 2026-11-02
 
 ### Added

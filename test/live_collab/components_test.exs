@@ -102,4 +102,22 @@ defmodule LiveCollab.ComponentsTest do
       assert Keyword.get(attrs, :"aria-description") == "Sarah is viewing on this item"
     end
   end
+
+  describe "collab_cursor_attrs/2" do
+    test "generates default cursor hook attributes" do
+      attrs = Components.collab_cursor_attrs("canvas_main")
+
+      assert Keyword.get(attrs, :"phx-hook") == "LiveCollabCursor"
+      assert Keyword.get(attrs, :"data-collab-container") == "canvas_main"
+      assert Keyword.get(attrs, :"data-collab-throttle") == "30"
+      assert Keyword.get(attrs, :"data-collab-deadband") == "0.0015"
+    end
+
+    test "respects custom throttle and deadband options" do
+      attrs = Components.collab_cursor_attrs("board", throttle: 50, deadband: 0.005)
+
+      assert Keyword.get(attrs, :"data-collab-throttle") == "50"
+      assert Keyword.get(attrs, :"data-collab-deadband") == "0.005"
+    end
+  end
 end

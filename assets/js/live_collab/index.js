@@ -16,11 +16,13 @@
 
 import { LiveCollabField } from "./hooks/live_collab_field.js";
 import { LiveCollabElement } from "./hooks/live_collab_element.js";
+import { LiveCollabCursor } from "./hooks/live_collab_cursor.js";
 
 export const LiveCollabHooks = {
   LiveCollabField,
-  LiveCollabElement
+  LiveCollabElement,
+  LiveCollabCursor
 };
 
-export { LiveCollabField, LiveCollabElement };
+export { LiveCollabField, LiveCollabElement, LiveCollabCursor };
 export default LiveCollabHooks;
