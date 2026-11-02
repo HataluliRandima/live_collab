@@ -25,13 +25,15 @@ defmodule LiveCollab.LiveView do
   import Phoenix.LiveView
 
   alias LiveCollab.Config
+  alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.Presence
 
   @doc """
   Tracks the collaborative session, subscribes to PubSub presence notifications,
-  populates initial assigns (`collab_users`, `collab_locks`, `collab_topic`, `collab_client_id`),
-  and attaches lifecycle hooks to handle focus/blur events and presence diffs.
+  populates initial assigns (`collab_users`, `collab_locks`, `collab_activities`,
+  `collab_topic`, `collab_client_id`), and attaches lifecycle hooks to handle
+  field focus/blur, element activity, and presence diffs.
   """
   @spec track(
           socket :: Phoenix.LiveView.Socket.t(),
@@ -71,12 +73,15 @@ defmodule LiveCollab.LiveView do
 
     users = Presence.extract_users(presence_entries)
     locks = Field.extract_locks(presence_entries)
+    activities = Element.extract_activities(presence_entries)
 
     socket
     |> assign(:collab_topic, topic)
     |> assign(:collab_client_id, client_id)
     |> assign(:collab_users, users)
     |> assign(:collab_locks, locks)
+    |> assign(:collab_activities, activities)
+    |> assign(:collab_active_element, nil)
     |> assign(:collab_config, config)
   end
 
@@ -99,6 +104,8 @@ defmodule LiveCollab.LiveView do
     |> assign(:collab_topic, nil)
     |> assign(:collab_users, [])
     |> assign(:collab_locks, %{})
+    |> assign(:collab_activities, %{})
+    |> assign(:collab_active_element, nil)
   end
 
   @doc """
@@ -114,6 +121,7 @@ defmodule LiveCollab.LiveView do
     entries = presence_module.list(topic)
     new_users = Presence.extract_users(entries)
     new_locks = Field.extract_locks(entries)
+    new_activities = Element.extract_activities(entries)
 
     current_client_id = socket.assigns[:collab_client_id]
     current_editing_field = socket.assigns[:collab_editing_field]
@@ -148,6 +156,7 @@ defmodule LiveCollab.LiveView do
     socket
     |> assign(:collab_users, new_users)
     |> assign(:collab_locks, new_locks)
+    |> assign(:collab_activities, new_activities)
   end
 
   # ============================================================================
@@ -181,6 +190,40 @@ defmodule LiveCollab.LiveView do
         Presence.clear_field(presence_mod, sock, topic, user_id, client_id)
 
         {:halt, assign(sock, :collab_editing_field, nil)}
+
+      "live_collab:element_active", %{"element" => raw_element} = params, sock ->
+        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+
+        case Element.validate_element_id(raw_element, config.max_field_id_length) do
+          {:ok, element_id} ->
+            type = Element.normalize_activity_type(params["type"])
+            topic = sock.assigns.collab_topic
+            user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
+
+            Presence.update_element(
+              presence_mod,
+              sock,
+              topic,
+              user_id,
+              element_id,
+              type,
+              client_id
+            )
+
+            {:halt, assign(sock, :collab_active_element, element_id)}
+
+          {:error, _reason} ->
+            {:halt, sock}
+        end
+
+      "live_collab:element_inactive", params, sock ->
+        client_id = params["client_id"] || sock.assigns[:collab_client_id]
+        topic = sock.assigns.collab_topic
+        user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
+
+        Presence.clear_element(presence_mod, sock, topic, user_id, client_id)
+
+        {:halt, assign(sock, :collab_active_element, nil)}
 
       _other_event, _params, sock ->
         {:cont, sock}
@@ -267,6 +310,48 @@ defmodule LiveCollab.LiveView do
         LiveCollab.Presence.clear_field(presence_mod, socket, topic, user_id, client_id)
 
         {:noreply, assign(socket, :collab_editing_field, nil)}
+      end
+
+      def handle_event("live_collab:element_active", %{"element" => element} = params, socket) do
+        client_id = params["client_id"] || socket.assigns[:collab_client_id]
+        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+        presence_mod = config.presence
+        topic = socket.assigns.collab_topic
+        user = socket.assigns[:current_user] || %{}
+        user_id = Map.get(user, :id) || client_id
+
+        case LiveCollab.Element.validate_element_id(element, config.max_field_id_length) do
+          {:ok, element_id} ->
+            type = LiveCollab.Element.normalize_activity_type(params["type"])
+
+            LiveCollab.Presence.update_element(
+              presence_mod,
+              socket,
+              topic,
+              user_id,
+              element_id,
+              type,
+              client_id
+            )
+
+            {:noreply, assign(socket, :collab_active_element, element_id)}
+
+          {:error, _} ->
+            {:noreply, socket}
+        end
+      end
+
+      def handle_event("live_collab:element_inactive", params, socket) do
+        client_id = params["client_id"] || socket.assigns[:collab_client_id]
+        config = socket.assigns[:collab_config] || LiveCollab.Config.get(unquote(opts))
+        presence_mod = config.presence
+        topic = socket.assigns.collab_topic
+        user = socket.assigns[:current_user] || %{}
+        user_id = Map.get(user, :id) || client_id
+
+        LiveCollab.Presence.clear_element(presence_mod, socket, topic, user_id, client_id)
+
+        {:noreply, assign(socket, :collab_active_element, nil)}
       end
 
       def handle_info(

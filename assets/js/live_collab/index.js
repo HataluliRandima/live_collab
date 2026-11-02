@@ -15,10 +15,12 @@
  */
 
 import { LiveCollabField } from "./hooks/live_collab_field.js";
+import { LiveCollabElement } from "./hooks/live_collab_element.js";
 
 export const LiveCollabHooks = {
-  LiveCollabField
+  LiveCollabField,
+  LiveCollabElement
 };
 
-export { LiveCollabField };
+export { LiveCollabField, LiveCollabElement };
 export default LiveCollabHooks;
