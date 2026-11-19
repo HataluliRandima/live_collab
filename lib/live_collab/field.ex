@@ -60,7 +60,10 @@ defmodule LiveCollab.Field do
       not String.valid?(field_id) ->
         {:error, :invalid_encoding}
 
-      Regex.match?(~r/^[a-zA-Z0-9_\.\-:\/\[\]]+$/, field_id) ->
+      String.contains?(field_id, "..") ->
+        {:error, :disallowed_characters}
+
+      Regex.match?(~r/^[a-zA-Z0-9_\.\-:\[\]]+$/, field_id) ->
         {:ok, field_id}
 
       true ->

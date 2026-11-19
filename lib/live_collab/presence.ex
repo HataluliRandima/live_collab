@@ -10,9 +10,6 @@ defmodule LiveCollab.Presence do
   - Shared element and row activity updates
   """
 
-  alias LiveCollab.Config
-  alias LiveCollab.Field
-
   # 12 high-contrast, accessible, visually distinct hex colors for avatar badges
   @default_palette [
     "#4F46E5",

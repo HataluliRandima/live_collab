@@ -55,6 +55,9 @@ defmodule LiveCollab.Element do
       not String.valid?(element_id) ->
         {:error, :invalid_encoding}
 
+      String.contains?(element_id, "..") ->
+        {:error, :disallowed_characters}
+
       Regex.match?(~r/^[a-zA-Z0-9_\.\-:\/\[\]]+$/, element_id) ->
         {:ok, element_id}
 
