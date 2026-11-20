@@ -1,0 +1,42 @@
+name: Bug report
+description: Something in LiveCollab does not behave as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Security issues must not be reported here** — see SECURITY.md.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest LiveView / template / JS snippet that shows the problem. A failing test is ideal.
+      render: elixir
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: LiveCollab, Elixir, OTP, Phoenix, Phoenix LiveView
+      placeholder: "live_collab 0.5.0, Elixir 1.17.3, OTP 27, Phoenix 1.8.1, LiveView 1.1.4"
+    validations:
+      required: true
+  - type: dropdown
+    id: topology
+    attributes:
+      label: Deployment
+      options:
+        - Single node
+        - Clustered (multiple nodes)
+        - Not sure
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / stack traces
+      render: text

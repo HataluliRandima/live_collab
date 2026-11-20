@@ -1,35 +1,25 @@
 /**
  * LiveCollab - Viewport & Scroll Following Hook
  *
- * Provides real-time presenter following and collaborative scroll synchronization.
- *
- * Capabilities:
- * - Normalized scroll positions [0.0, 1.0] across responsive layouts and window geometries
- * - Echo loop defense: Suppresses scroll broadcasts during programmatic follower scrolling
- * - Follower auto-breakout: Automatically disengages follow mode when user manually scrolls
- * - Smooth scroll interpolation via native scrollTo({ behavior: 'smooth' })
- * - Spotlight presenter broadcast support
+ * - Presenters (`data-collab-presenter="true"`) broadcast normalized scroll
+ *   positions [0.0, 1.0], throttled (default 40ms)
+ * - Followers scroll to the followed presenter's position; programmatic scrolls
+ *   are not re-broadcast (no feedback loops)
+ * - A manual scroll by a follower disengages follow mode and dispatches
+ *   `live_collab:follow_broken`
+ * - `live_collab:start_follow` / `live_collab:stop_follow` DOM events (as
+ *   dispatched by `<.follow_pill>`) are handled on `window`, so the control can
+ *   live anywhere on the page; `detail.container_id` scopes them to one container
+ * - With `data-collab-auto-follow="true"`, a started spotlight is followed
+ *   automatically; a stopped or departed presenter is unfollowed
  */
 
-function getTabClientId() {
-  const KEY = "live_collab_tab_id";
-  try {
-    let id = window.sessionStorage.getItem(KEY);
-    if (!id) {
-      id = typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-      window.sessionStorage.setItem(KEY, id);
-    }
-    return id;
-  } catch (_e) {
-    return "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-  }
-}
+import { finite, safePush } from "../utils.js";
+
+const PROGRAMMATIC_SCROLL_GUARD_MS = 400;
 
 export const LiveCollabViewport = {
   mounted() {
-    this.clientId = getTabClientId();
     this.containerId = this.el.dataset.collabContainer || "default";
     this.throttleMs = parseInt(this.el.dataset.collabThrottle, 10) || 40;
     this.isPresenter = this.el.dataset.collabPresenter === "true";
@@ -40,116 +30,105 @@ export const LiveCollabViewport = {
     this.programmaticScrollTimer = null;
 
     this.handleScroll = this.handleScroll.bind(this);
-    this.handleViewportMoved = this.handleViewportMoved.bind(this);
-    this.handleSpotlightStatus = this.handleSpotlightStatus.bind(this);
+    this.handleStartFollow = this.handleStartFollow.bind(this);
+    this.handleStopFollow = this.handleStopFollow.bind(this);
 
-    // Scroll listener on container or window
     this.target = this.el === document.body || this.el.dataset.collabWindow === "true" ? window : this.el;
     this.target.addEventListener("scroll", this.handleScroll, { passive: true });
+    window.addEventListener("live_collab:start_follow", this.handleStartFollow);
+    window.addEventListener("live_collab:stop_follow", this.handleStopFollow);
 
-    // Handle remote viewport broadcasts pushed from server (zero assigns diffing)
-    this.handleEvent("live_collab:viewport_moved", this.handleViewportMoved);
-    this.handleEvent("live_collab:spotlight_status", this.handleSpotlightStatus);
-
-    // Custom DOM events for UI control
-    this.el.addEventListener("live_collab:start_follow", (e) => {
-      this.followingClientId = e.detail.client_id;
-    });
-
-    this.el.addEventListener("live_collab:stop_follow", () => {
-      this.followingClientId = null;
-    });
+    this.handleEvent("live_collab:viewport_moved", (payload) => this.handleViewportMoved(payload));
+    this.handleEvent("live_collab:spotlight_status", (payload) => this.handleSpotlightStatus(payload));
   },
 
   updated() {
     this.isPresenter = this.el.dataset.collabPresenter === "true";
-    this.followingClientId = this.el.dataset.collabFollowing || this.followingClientId;
+    if (this.el.dataset.collabFollowing) this.followingClientId = this.el.dataset.collabFollowing;
   },
 
   destroyed() {
-    if (this.programmaticScrollTimer) {
-      clearTimeout(this.programmaticScrollTimer);
-    }
+    clearTimeout(this.programmaticScrollTimer);
     this.target.removeEventListener("scroll", this.handleScroll);
+    window.removeEventListener("live_collab:start_follow", this.handleStartFollow);
+    window.removeEventListener("live_collab:stop_follow", this.handleStopFollow);
+  },
+
+  targetsThisContainer(event) {
+    const containerId = event && event.detail && event.detail.container_id;
+    return containerId == null || containerId === this.containerId;
+  },
+
+  handleStartFollow(event) {
+    if (!this.targetsThisContainer(event)) return;
+    const clientId = event.detail && event.detail.client_id;
+    if (typeof clientId === "string") this.followingClientId = clientId;
+  },
+
+  handleStopFollow(event) {
+    if (this.targetsThisContainer(event)) this.followingClientId = null;
   },
 
   handleScroll(_event) {
-    // Crucial: Ignore scroll events triggered programmatically by follow synchronization
-    // to prevent infinite feedback loops!
-    if (this.isProgrammaticScroll) {
-      return;
-    }
+    if (this.isProgrammaticScroll) return;
 
-    // If follower manually scrolls with wheel or scrollbar, break out of follow mode
     if (this.followingClientId) {
       const brokenClientId = this.followingClientId;
       this.followingClientId = null;
-
-      this.el.dispatchEvent(new CustomEvent("live_collab:follow_broken", {
-        bubbles: true,
-        detail: { leader_client_id: brokenClientId }
-      }));
+      this.el.dispatchEvent(
+        new CustomEvent("live_collab:follow_broken", { bubbles: true, detail: { leader_client_id: brokenClientId } })
+      );
     }
 
-    // Only broadcast scroll if this client is presenting / leading
-    if (!this.isPresenter && !this.el.dataset.collabBroadcast) {
-      return;
-    }
+    if (!this.isPresenter && !this.el.dataset.collabBroadcast) return;
 
     const now = performance.now();
-    if (now - this.lastSentAt < this.throttleMs) {
-      return;
-    }
-
-    const scrollMetrics = this.getScrollMetrics();
-    if (!scrollMetrics) return;
-
+    if (now - this.lastSentAt < this.throttleMs) return;
     this.lastSentAt = now;
 
-    this.pushEvent("live_collab:viewport_move", {
-      scroll_x: scrollMetrics.pctX,
-      scroll_y: scrollMetrics.pctY,
+    const metrics = this.getScrollMetrics();
+    safePush(this, "live_collab:viewport_move", {
+      scroll_x: metrics.pctX,
+      scroll_y: metrics.pctY,
       zoom: 1.0,
-      container_id: this.containerId,
-      client_id: this.clientId
+      container_id: this.containerId
     });
   },
 
   handleViewportMoved(payload) {
-    if (payload.client_id === this.clientId) return;
-    if (payload.container_id && payload.container_id !== this.containerId) return;
+    if (!payload || (payload.container_id != null && payload.container_id !== this.containerId)) return;
 
-    // Only apply scroll synchronization if currently following this broadcaster
-    if (this.followingClientId === payload.client_id) {
-      this.scrollToNormalized(payload.scroll_x, payload.scroll_y);
+    const x = finite(payload.scroll_x);
+    const y = finite(payload.scroll_y);
+    if (x === null || y === null) return;
+
+    if (this.followingClientId && this.followingClientId === payload.client_id) {
+      this.scrollToNormalized(x, y);
     }
 
-    // Dispatch DOM event so an optional minimap or viewport frustum overlay can render
-    this.el.dispatchEvent(new CustomEvent("live_collab:peer_viewport", {
-      bubbles: true,
-      detail: payload
-    }));
+    // For minimaps / viewport frustum overlays.
+    this.el.dispatchEvent(new CustomEvent("live_collab:peer_viewport", { bubbles: true, detail: payload }));
   },
 
   handleSpotlightStatus(payload) {
-    if (payload.client_id === this.clientId) return;
+    if (!payload) return;
 
     if (payload.active && this.el.dataset.collabAutoFollow === "true") {
       this.followingClientId = payload.client_id;
+    } else if (!payload.active && this.followingClientId === payload.client_id) {
+      this.followingClientId = null;
     }
 
-    this.el.dispatchEvent(new CustomEvent("live_collab:spotlight_change", {
-      bubbles: true,
-      detail: payload
-    }));
+    this.el.dispatchEvent(new CustomEvent("live_collab:spotlight_change", { bubbles: true, detail: payload }));
   },
 
   getScrollMetrics() {
     const isWin = this.target === window;
-    const scrollLeft = isWin ? window.scrollX || document.documentElement.scrollLeft : this.target.scrollLeft;
-    const scrollTop = isWin ? window.scrollY || document.documentElement.scrollTop : this.target.scrollTop;
-    const scrollWidth = isWin ? document.documentElement.scrollWidth : this.target.scrollWidth;
-    const scrollHeight = isWin ? document.documentElement.scrollHeight : this.target.scrollHeight;
+    const doc = document.documentElement;
+    const scrollLeft = isWin ? window.scrollX || doc.scrollLeft : this.target.scrollLeft;
+    const scrollTop = isWin ? window.scrollY || doc.scrollTop : this.target.scrollTop;
+    const scrollWidth = isWin ? doc.scrollWidth : this.target.scrollWidth;
+    const scrollHeight = isWin ? doc.scrollHeight : this.target.scrollHeight;
     const clientWidth = isWin ? window.innerWidth : this.target.clientWidth;
     const clientHeight = isWin ? window.innerHeight : this.target.clientHeight;
 
@@ -164,31 +143,24 @@ export const LiveCollabViewport = {
 
   scrollToNormalized(pctX, pctY) {
     const isWin = this.target === window;
-    const scrollWidth = isWin ? document.documentElement.scrollWidth : this.target.scrollWidth;
-    const scrollHeight = isWin ? document.documentElement.scrollHeight : this.target.scrollHeight;
+    const doc = document.documentElement;
+    const scrollWidth = isWin ? doc.scrollWidth : this.target.scrollWidth;
+    const scrollHeight = isWin ? doc.scrollHeight : this.target.scrollHeight;
     const clientWidth = isWin ? window.innerWidth : this.target.clientWidth;
     const clientHeight = isWin ? window.innerHeight : this.target.clientHeight;
 
-    const targetX = pctX * Math.max(scrollWidth - clientWidth, 0);
-    const targetY = pctY * Math.max(scrollHeight - clientHeight, 0);
+    const left = Math.min(Math.max(pctX, 0), 1) * Math.max(scrollWidth - clientWidth, 0);
+    const top = Math.min(Math.max(pctY, 0), 1) * Math.max(scrollHeight - clientHeight, 0);
 
-    // Set guard flag before scrolling
     this.isProgrammaticScroll = true;
+    (isWin ? window : this.target).scrollTo({ left, top, behavior: "smooth" });
 
-    if (isWin) {
-      window.scrollTo({ left: targetX, top: targetY, behavior: "smooth" });
-    } else {
-      this.target.scrollTo({ left: targetX, top: targetY, behavior: "smooth" });
-    }
-
-    // Reset guard after smooth scroll animation completes (~350ms)
-    if (this.programmaticScrollTimer) clearTimeout(this.programmaticScrollTimer);
+    clearTimeout(this.programmaticScrollTimer);
     this.programmaticScrollTimer = setTimeout(() => {
       this.isProgrammaticScroll = false;
       this.programmaticScrollTimer = null;
-    }, 400);
+    }, PROGRAMMATIC_SCROLL_GUARD_MS);
   }
 };
 
 export default LiveCollabViewport;
-

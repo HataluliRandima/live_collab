@@ -10,6 +10,7 @@ defmodule LiveCollab.Components do
   alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.Presence
+  alias Phoenix.LiveView.JS
 
   @doc """
   Renders an accessible avatar stack for active collaborative users.
@@ -37,7 +38,10 @@ defmodule LiveCollab.Components do
   attr :max, :integer, default: 4, doc: "Maximum visible avatars before overflow indicator"
   attr :size, :string, default: "md", values: ["xs", "sm", "md", "lg"]
   attr :class, :string, default: nil, doc: "Optional CSS classes on wrapper"
-  attr :show_tabs_count, :boolean, default: true, doc: "Show count badge if user has multiple tabs"
+
+  attr :show_tabs_count, :boolean,
+    default: true,
+    doc: "Show count badge if user has multiple tabs"
 
   slot :user_avatar, doc: "Custom avatar rendering slot for each user"
   slot :overflow_indicator, doc: "Custom overflow rendering slot"
@@ -121,7 +125,7 @@ defmodule LiveCollab.Components do
             "rounded-full ring-2 ring-white text-white font-medium flex items-center justify-center shadow-sm select-none",
             avatar_size_class(@size)
           ]}
-          style={"background-color: #{@user.color};"}
+          style={"background-color: #{css_color(@user[:color], @user[:id])};"}
         >
           <%= @user.initials %>
         </div>
@@ -175,7 +179,7 @@ defmodule LiveCollab.Components do
           "live-collab-field-indicator inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium text-white shadow-sm transition-all duration-150 animate-fadeIn",
           @class
         ]}
-        style={"background-color: #{@lock.user_color || "#4F46E5"};"}
+        style={"background-color: #{css_color(@lock[:user_color], @lock[:user_id])};"}
       >
         <span class="inline-block w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
         <span class="truncate max-w-[140px]"><%= @lock.user_name %> is editing</span>
@@ -243,7 +247,7 @@ defmodule LiveCollab.Components do
                     "rounded-full ring-1 ring-white text-white font-medium flex items-center justify-center select-none",
                     avatar_size_class(@size)
                   ]}
-                  style={"background-color: #{user.user_color};"}
+                  style={"background-color: #{css_color(user[:user_color], user[:user_id])};"}
                 >
                   <%= Presence.initials(user.user_name) %>
                 </div>
@@ -327,7 +331,7 @@ defmodule LiveCollab.Components do
                   "rounded-full ring-1 ring-white text-white font-medium flex items-center justify-center select-none",
                   avatar_size_class(@size)
                 ]}
-                style={"background-color: #{user.user_color};"}
+                style={"background-color: #{css_color(user[:user_color], user[:user_id])};"}
               >
                 <%= Presence.initials(user.user_name) %>
               </div>
@@ -367,9 +371,16 @@ defmodule LiveCollab.Components do
         <div>Your collaborative board content</div>
       </.cursor_layer>
   """
-  attr :container_id, :string, default: "default", doc: "Identifier for container-relative coordinate mapping"
+  attr :container_id, :string,
+    default: "default",
+    doc: "Identifier for container-relative coordinate mapping"
+
   attr :throttle, :integer, default: 30, doc: "Client throttle in milliseconds (~33 fps)"
-  attr :deadband, :float, default: 0.0015, doc: "Normalized distance threshold to avoid jitter broadcasts"
+
+  attr :deadband, :float,
+    default: 0.0015,
+    doc: "Normalized distance threshold to avoid jitter broadcasts"
+
   attr :class, :string, default: nil, doc: "CSS classes on the outer container"
   slot :inner_block, required: false
 
@@ -394,7 +405,11 @@ defmodule LiveCollab.Components do
       </.viewport_container>
   """
   attr :container_id, :string, default: "default"
-  attr :presenter, :boolean, default: false, doc: "Whether this client is broadcasting scroll position as presenter"
+
+  attr :presenter, :boolean,
+    default: false,
+    doc: "Whether this client is broadcasting scroll position as presenter"
+
   attr :following, :string, default: nil, doc: "Client ID of presenter to follow"
   attr :throttle, :integer, default: 40, doc: "Scroll broadcast throttle in milliseconds"
   attr :class, :string, default: nil
@@ -418,33 +433,55 @@ defmodule LiveCollab.Components do
   @doc """
   Renders an interactive pill showing who is currently presenting/leading, with
   a button to follow or unfollow.
+
+  The button dispatches a bubbling `live_collab:start_follow` /
+  `live_collab:stop_follow` DOM event (via `Phoenix.LiveView.JS.dispatch/2`, so
+  it works under a strict Content-Security-Policy). `LiveCollabViewport` hooks
+  listen for it on `window`, so the pill can be placed anywhere on the page.
+  Set `container_id` to target one specific viewport container when a page has
+  several.
   """
   attr :leader_name, :string, required: true
   attr :leader_client_id, :string, required: true
   attr :leader_color, :string, default: "#4F46E5"
   attr :is_following, :boolean, default: false
+  attr :container_id, :string, default: nil, doc: "Only this viewport container reacts"
   attr :class, :string, default: nil
 
   def follow_pill(assigns) do
+    event =
+      if assigns.is_following, do: "live_collab:stop_follow", else: "live_collab:start_follow"
+
+    detail = %{client_id: assigns.leader_client_id, container_id: assigns.container_id}
+    assigns = assign(assigns, :on_click, JS.dispatch(event, detail: detail))
+
     ~H"""
-    <div
-      class={[
-        "live-collab-follow-pill inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium shadow-md transition-all select-none",
-        if(@is_following, do: "bg-gray-900 text-white ring-2 ring-indigo-500", else: "bg-white text-gray-800 border border-gray-200"),
-        @class
-      ]}
-    >
-      <span class="w-2 h-2 rounded-full animate-pulse" style={"background-color: #{@leader_color};"}></span>
-      <span><%= @leader_name %> is presenting</span>
+    <div class={[
+      "live-collab-follow-pill inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium shadow-md transition-all select-none",
+      if(@is_following,
+        do: "bg-gray-900 text-white ring-2 ring-indigo-500",
+        else: "bg-white text-gray-800 border border-gray-200"
+      ),
+      @class
+    ]}>
+      <span
+        class="w-2 h-2 rounded-full animate-pulse"
+        style={"background-color: #{css_color(@leader_color, @leader_client_id)};"}
+      >
+      </span>
+      <span>{@leader_name} is presenting</span>
       <button
         type="button"
+        phx-click={@on_click}
         class={[
           "ml-1 px-2 py-0.5 rounded text-[11px] font-semibold transition-colors",
-          if(@is_following, do: "bg-gray-800 text-gray-200 hover:bg-gray-700", else: "bg-indigo-600 text-white hover:bg-indigo-500")
+          if(@is_following,
+            do: "bg-gray-800 text-gray-200 hover:bg-gray-700",
+            else: "bg-indigo-600 text-white hover:bg-indigo-500"
+          )
         ]}
-        onclick={"this.closest('.live-collab-viewport-container, body').dispatchEvent(new CustomEvent('#{if @is_following, do: "live_collab:stop_follow", else: "live_collab:start_follow"}', {bubbles: true, detail: {client_id: '#{@leader_client_id}'}}))"}
       >
-        <%= if @is_following, do: "Stop Following", else: "Follow" %>
+        {if @is_following, do: "Stop Following", else: "Follow"}
       </button>
     </div>
     """
@@ -618,7 +655,8 @@ defmodule LiveCollab.Components do
 
         attrs ++
           [
-            style: "--collab-element-color: #{primary_user.user_color};",
+            style:
+              "--collab-element-color: #{css_color(primary_user[:user_color], primary_user[:user_id])};",
             "aria-description": "#{summary} on this item"
           ]
       else
@@ -645,6 +683,11 @@ defmodule LiveCollab.Components do
   defp collaborator_summary([first | rest]) do
     "#{first.user_name} and #{length(rest)} others are viewing"
   end
+
+  # Colors end up inside `style` attributes. HEEx escapes HTML, not CSS, so only
+  # strict hex colors are allowed through; anything else falls back to the
+  # deterministic palette color.
+  defp css_color(color, id), do: Presence.safe_color(color, id)
 
   defp avatar_size_class("xs"), do: "w-5 h-5 text-[10px]"
   defp avatar_size_class("sm"), do: "w-7 h-7 text-xs"

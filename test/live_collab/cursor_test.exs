@@ -23,14 +23,16 @@ defmodule LiveCollab.CursorTest do
     test "rejects out of bounds coordinates" do
       assert {:error, :coordinate_out_of_bounds} = Cursor.validate_coordinates(-0.5, 0.5)
       assert {:error, :coordinate_out_of_bounds} = Cursor.validate_coordinates(0.5, 2.5)
-      assert {:error, :coordinate_out_of_bounds} = Cursor.validate_coordinates(99999.0, 0.0)
+      assert {:error, :coordinate_out_of_bounds} = Cursor.validate_coordinates(99_999.0, 0.0)
     end
 
     test "rejects non-numeric data types" do
       assert {:error, :invalid_coordinate_type} = Cursor.validate_coordinates(nil, 0.5)
       assert {:error, :invalid_coordinate_type} = Cursor.validate_coordinates(%{"x" => 1}, 0.5)
       assert {:error, :invalid_coordinate_type} = Cursor.validate_coordinates([1, 2], 0.5)
-      assert {:error, :invalid_coordinate_format} = Cursor.validate_coordinates("not_a_number", 0.5)
+
+      assert {:error, :invalid_coordinate_format} =
+               Cursor.validate_coordinates("not_a_number", 0.5)
     end
   end
 

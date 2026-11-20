@@ -1,57 +1,49 @@
 /**
  * LiveCollab - Collaborative Cursors Hook
  *
- * Provides high-performance, butter-smooth multiplayer cursors via:
- * - Normalized container coordinates [0.0, 1.0] ensuring alignment across all display resolutions
- * - Client-side throttled broadcast (30ms / ~33 fps) with distance deadband
- * - Client-side requestAnimationFrame interpolation (smooth 60/120fps rendering)
- * - Zero LiveView assigns diffing or server DOM reconciliation
- * - Accessible, hardware-accelerated SVG pointers with customizable user name pills
+ * - Normalized container coordinates [0.0, 1.0], so cursors align across screen sizes
+ * - Throttled broadcast (default 30ms) with a distance deadband
+ * - requestAnimationFrame interpolation that runs only while cursors are moving
+ * - No LiveView re-renders: positions arrive via push_event and are drawn here
+ * - Remote cursors fade after inactivity and are removed from the DOM shortly after,
+ *   and immediately when the collaborator leaves (`live_collab:peers_left`)
+ *
+ * Security: remote names and colors come from other users. Names are written
+ * with textContent only and colors must be #rrggbb, so no markup or CSS can be
+ * injected into this page.
  */
 
-function getTabClientId() {
-  const KEY = "live_collab_tab_id";
-  try {
-    let id = window.sessionStorage.getItem(KEY);
-    if (!id) {
-      id = typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-      window.sessionStorage.setItem(KEY, id);
-    }
-    return id;
-  } catch (_e) {
-    return "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-  }
-}
+import { departedClientIds, finite, matchesContainer, safeColor, safeName, safePush } from "../utils.js";
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const POINTER_PATH = "M5.65376 12.3673H5.46026L5.31717 12.4976L0.500002 16.8829L0.500002 1.19841L11.7841 12.3673H5.65376Z";
+const LERP = 0.35;
+const SETTLE_EPSILON = 0.0005;
 
 export const LiveCollabCursor = {
   mounted() {
-    this.clientId = getTabClientId();
     this.containerId = this.el.dataset.collabContainer || "default";
     this.throttleMs = parseInt(this.el.dataset.collabThrottle, 10) || 30;
     this.deadband = parseFloat(this.el.dataset.collabDeadband) || 0.0015;
+    this.fadeMs = parseInt(this.el.dataset.collabFadeMs, 10) || 4000;
+    this.removeMs = this.fadeMs + 1000;
 
     this.lastSentAt = 0;
     this.lastSentX = -1;
     this.lastSentY = -1;
-
-    // Remote cursors state map: { client_id => { el, currentX, currentY, targetX, targetY, fadeTimer } }
     this.remoteCursors = new Map();
     this.animationFrameId = null;
 
-    // Ensure container has relative/absolute positioning so overlay aligns perfectly
-    const computedStyle = window.getComputedStyle(this.el);
-    if (computedStyle.position === "static") {
+    if (window.getComputedStyle(this.el).position === "static") {
       this.el.style.position = "relative";
     }
 
-    // Create the pointer-events-none cursor layer
     this.cursorLayer = document.createElement("div");
-    this.cursorLayer.className = "live-collab-cursor-layer pointer-events-none absolute inset-0 overflow-hidden z-50 select-none";
+    this.cursorLayer.className =
+      "live-collab-cursor-layer pointer-events-none absolute inset-0 overflow-hidden z-50 select-none";
+    this.cursorLayer.setAttribute("aria-hidden", "true");
     this.el.appendChild(this.cursorLayer);
 
-    // Event listeners
     this.handlePointerMove = this.handlePointerMove.bind(this);
     this.handlePointerLeave = this.handlePointerLeave.bind(this);
     this.renderLoop = this.renderLoop.bind(this);
@@ -59,51 +51,28 @@ export const LiveCollabCursor = {
     this.el.addEventListener("pointermove", this.handlePointerMove);
     this.el.addEventListener("pointerleave", this.handlePointerLeave);
 
-    // Handle remote cursor messages pushed from server (zero assigns diffing)
-    this.handleCursorMoved = (payload) => {
-      if (payload.client_id === this.clientId) return;
-      if (payload.container_id && payload.container_id !== this.containerId) return;
+    this.handleEvent("live_collab:cursor_moved", (payload) => {
+      if (matchesContainer(payload, this.containerId)) this.updateRemoteCursor(payload);
+    });
 
-      this.updateRemoteCursor(payload);
-    };
+    this.handleEvent("live_collab:cursor_left", (payload) => {
+      if (matchesContainer(payload, this.containerId)) this.removeRemoteCursor(payload.client_id);
+    });
 
-    this.handleCursorLeft = (payload) => {
-      if (payload.client_id === this.clientId) return;
-      this.removeRemoteCursor(payload.client_id);
-    };
-
-    this.handleEvent("live_collab:cursor_moved", this.handleCursorMoved);
-    this.handleEvent("live_collab:cursor_left", this.handleCursorLeft);
-
-    // Start RAF interpolation render loop
-    this.animationFrameId = requestAnimationFrame(this.renderLoop);
+    this.handleEvent("live_collab:peers_left", (payload) => {
+      departedClientIds(payload).forEach((id) => this.removeRemoteCursor(id));
+    });
   },
 
   destroyed() {
-    if (this.animationFrameId) {
-      cancelAnimationFrame(this.animationFrameId);
-      this.animationFrameId = null;
-    }
-
+    this.stopLoop();
     this.el.removeEventListener("pointermove", this.handlePointerMove);
     this.el.removeEventListener("pointerleave", this.handlePointerLeave);
 
-    // Clean up all remote cursor DOM nodes and timers
-    this.remoteCursors.forEach((cursor) => {
-      if (cursor.fadeTimer) clearTimeout(cursor.fadeTimer);
-      if (cursor.el && cursor.el.parentNode) cursor.el.remove();
-    });
-    this.remoteCursors.clear();
+    this.remoteCursors.forEach((_cursor, clientId) => this.removeRemoteCursor(clientId));
+    if (this.cursorLayer) this.cursorLayer.remove();
 
-    if (this.cursorLayer && this.cursorLayer.parentNode) {
-      this.cursorLayer.remove();
-    }
-
-    // Notify peers that local cursor left
-    this.pushEvent("live_collab:cursor_left", {
-      container_id: this.containerId,
-      client_id: this.clientId
-    });
+    safePush(this, "live_collab:cursor_left", { container_id: this.containerId });
   },
 
   handlePointerMove(event) {
@@ -113,11 +82,9 @@ export const LiveCollabCursor = {
     const rect = this.el.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
 
-    // Calculate normalized container coordinates [0.0, 1.0]
     const normX = (event.clientX - rect.left) / rect.width;
     const normY = (event.clientY - rect.top) / rect.height;
 
-    // Check distance deadband to avoid transmitting micro-tremors
     const dx = normX - this.lastSentX;
     const dy = normY - this.lastSentY;
     if (Math.sqrt(dx * dx + dy * dy) < this.deadband) return;
@@ -126,100 +93,131 @@ export const LiveCollabCursor = {
     this.lastSentX = normX;
     this.lastSentY = normY;
 
-    this.pushEvent("live_collab:cursor_move", {
-      x: normX,
-      y: normY,
-      container_id: this.containerId,
-      client_id: this.clientId
-    });
+    safePush(this, "live_collab:cursor_move", { x: normX, y: normY, container_id: this.containerId });
   },
 
   handlePointerLeave(_event) {
-    this.pushEvent("live_collab:cursor_left", {
-      container_id: this.containerId,
-      client_id: this.clientId
-    });
+    this.lastSentX = -1;
+    this.lastSentY = -1;
+    safePush(this, "live_collab:cursor_left", { container_id: this.containerId });
+  },
+
+  buildCursorElement(name, color) {
+    const el = document.createElement("div");
+    el.className = "live-collab-remote-cursor absolute top-0 left-0 transition-opacity duration-200";
+    el.style.willChange = "transform";
+
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("width", "22");
+    svg.setAttribute("height", "22");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", "none");
+
+    const path = document.createElementNS(SVG_NS, "path");
+    path.setAttribute("d", POINTER_PATH);
+    path.setAttribute("fill", color);
+    path.setAttribute("stroke", "#FFFFFF");
+    path.setAttribute("stroke-width", "1.2");
+    svg.appendChild(path);
+
+    const pill = document.createElement("div");
+    pill.className =
+      "live-collab-cursor-pill inline-block px-1.5 py-0.5 rounded text-[11px] font-semibold text-white whitespace-nowrap shadow-sm ml-3.5 -mt-2";
+    pill.style.backgroundColor = color;
+    pill.textContent = name;
+
+    el.appendChild(svg);
+    el.appendChild(pill);
+    return el;
   },
 
   updateRemoteCursor(payload) {
-    const { client_id, user_name, user_color, x, y } = payload;
-    let cursor = this.remoteCursors.get(client_id);
+    const clientId = payload && payload.client_id;
+    const x = finite(payload && payload.x);
+    const y = finite(payload && payload.y);
+    if (typeof clientId !== "string" || x === null || y === null) return;
+
+    let cursor = this.remoteCursors.get(clientId);
 
     if (!cursor) {
-      // Create new cursor DOM element
-      const el = document.createElement("div");
-      el.className = "live-collab-remote-cursor absolute top-0 left-0 transition-opacity duration-200";
-      el.style.opacity = "1";
-      el.style.willChange = "transform";
-
-      const color = user_color || "#4F46E5";
-      const name = user_name || "Collaborator";
-
-      // SVG arrow pointer + name pill
-      el.innerHTML = `
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" class="filter drop-shadow" style="transform: rotate(0deg);">
-          <path d="M5.65376 12.3673H5.46026L5.31717 12.4976L0.500002 16.8829L0.500002 1.19841L11.7841 12.3673H5.65376Z" fill="${color}" stroke="#FFFFFF" stroke-width="1.2"/>
-        </svg>
-        <div class="live-collab-cursor-pill inline-block px-1.5 py-0.5 rounded text-[11px] font-semibold text-white whitespace-nowrap shadow-sm ml-3.5 -mt-2" style="background-color: ${color};">
-          ${name}
-        </div>
-      `;
-
+      const el = this.buildCursorElement(safeName(payload.user_name), safeColor(payload.user_color));
       this.cursorLayer.appendChild(el);
-
-      cursor = {
-        el,
-        currentX: x,
-        currentY: y,
-        targetX: x,
-        targetY: y,
-        fadeTimer: null
-      };
-
-      this.remoteCursors.set(client_id, cursor);
+      cursor = { el, currentX: x, currentY: y, targetX: x, targetY: y, fadeTimer: null, removeTimer: null };
+      this.remoteCursors.set(clientId, cursor);
+      this.positionCursor(cursor);
     } else {
       cursor.targetX = x;
       cursor.targetY = y;
-      cursor.el.style.opacity = "1";
     }
 
-    // Reset 4-second inactivity fadeout timer
-    if (cursor.fadeTimer) clearTimeout(cursor.fadeTimer);
+    cursor.el.style.opacity = "1";
+    this.scheduleExpiry(clientId, cursor);
+    this.startLoop();
+  },
+
+  // Fade after inactivity, then drop the node entirely so departed or idle
+  // collaborators do not accumulate DOM nodes for the life of the page.
+  scheduleExpiry(clientId, cursor) {
+    clearTimeout(cursor.fadeTimer);
+    clearTimeout(cursor.removeTimer);
     cursor.fadeTimer = setTimeout(() => {
-      if (cursor.el) cursor.el.style.opacity = "0";
-    }, 4000);
+      cursor.el.style.opacity = "0";
+    }, this.fadeMs);
+    cursor.removeTimer = setTimeout(() => this.removeRemoteCursor(clientId), this.removeMs);
   },
 
   removeRemoteCursor(clientId) {
     const cursor = this.remoteCursors.get(clientId);
-    if (cursor) {
-      if (cursor.fadeTimer) clearTimeout(cursor.fadeTimer);
-      if (cursor.el) cursor.el.remove();
-      this.remoteCursors.delete(clientId);
+    if (!cursor) return;
+    clearTimeout(cursor.fadeTimer);
+    clearTimeout(cursor.removeTimer);
+    cursor.el.remove();
+    this.remoteCursors.delete(clientId);
+  },
+
+  positionCursor(cursor, rect = this.el.getBoundingClientRect()) {
+    cursor.el.style.transform = `translate3d(${cursor.currentX * rect.width}px, ${cursor.currentY * rect.height}px, 0)`;
+  },
+
+  startLoop() {
+    if (this.animationFrameId === null) {
+      this.animationFrameId = requestAnimationFrame(this.renderLoop);
     }
   },
 
-  renderLoop() {
-    const rect = this.el.getBoundingClientRect();
-    const width = rect.width;
-    const height = rect.height;
-
-    if (width > 0 && height > 0) {
-      this.remoteCursors.forEach((cursor) => {
-        // Linear interpolation (lerp) for buttery 60fps smoothing
-        cursor.currentX += (cursor.targetX - cursor.currentX) * 0.35;
-        cursor.currentY += (cursor.targetY - cursor.currentY) * 0.35;
-
-        const pixelX = cursor.currentX * width;
-        const pixelY = cursor.currentY * height;
-
-        cursor.el.style.transform = `translate3d(${pixelX}px, ${pixelY}px, 0)`;
-      });
+  stopLoop() {
+    if (this.animationFrameId !== null) {
+      cancelAnimationFrame(this.animationFrameId);
+      this.animationFrameId = null;
     }
+  },
 
-    this.animationFrameId = requestAnimationFrame(this.renderLoop);
+  // Runs only while at least one cursor is still moving towards its target, so
+  // an idle page does no per-frame layout work.
+  renderLoop() {
+    this.animationFrameId = null;
+    const rect = this.el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    let moving = false;
+    this.remoteCursors.forEach((cursor) => {
+      const dx = cursor.targetX - cursor.currentX;
+      const dy = cursor.targetY - cursor.currentY;
+
+      if (Math.abs(dx) < SETTLE_EPSILON && Math.abs(dy) < SETTLE_EPSILON) {
+        cursor.currentX = cursor.targetX;
+        cursor.currentY = cursor.targetY;
+      } else {
+        cursor.currentX += dx * LERP;
+        cursor.currentY += dy * LERP;
+        moving = true;
+      }
+
+      this.positionCursor(cursor, rect);
+    });
+
+    if (moving) this.startLoop();
   }
 };
 
 export default LiveCollabCursor;
-

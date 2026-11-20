@@ -67,9 +67,9 @@ defmodule LiveCollab.Viewport do
   @spec validate_viewport(term(), term(), term()) ::
           {:ok, float(), float(), float()} | {:error, atom()}
   def validate_viewport(scroll_x, scroll_y, zoom \\ 1.0) do
-    with {:ok, nx} <- parse_number(scroll_x),
-         {:ok, ny} <- parse_number(scroll_y),
-         {:ok, nz} <- parse_number(zoom),
+    with {:ok, nx} <- coordinate(scroll_x),
+         {:ok, ny} <- coordinate(scroll_y),
+         {:ok, nz} <- coordinate(zoom),
          :ok <- validate_scroll_bounds(nx, ny),
          :ok <- validate_zoom_bounds(nz) do
       {:ok, nx, ny, nz}
@@ -84,10 +84,10 @@ defmodule LiveCollab.Viewport do
   @spec validate_selection(term(), term(), term(), term()) ::
           {:ok, float(), float(), float(), float()} | {:error, atom()}
   def validate_selection(x, y, width, height) do
-    with {:ok, nx} <- parse_number(x),
-         {:ok, ny} <- parse_number(y),
-         {:ok, nw} <- parse_number(width),
-         {:ok, nh} <- parse_number(height),
+    with {:ok, nx} <- coordinate(x),
+         {:ok, ny} <- coordinate(y),
+         {:ok, nw} <- coordinate(width),
+         {:ok, nh} <- coordinate(height),
          :ok <- validate_selection_bounds(nx, ny, nw, nh) do
       {:ok, nx, ny, nw, nh}
     end
@@ -104,12 +104,7 @@ defmodule LiveCollab.Viewport do
           opts :: keyword()
         ) :: viewport_payload()
   def build_viewport_payload(client_id, user, scroll_x, scroll_y, opts \\ []) do
-    user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
-    user_name = Map.get(user, :name) || Map.get(user, "name") || "Collaborator"
-
-    user_color =
-      Map.get(user, :color) || Map.get(user, "color") ||
-        LiveCollab.Presence.deterministic_color(user_id)
+    {user_id, user_name, user_color} = LiveCollab.Presence.display_fields(user, client_id)
 
     zoom = Keyword.get(opts, :zoom, 1.0)
     container_id = Keyword.get(opts, :container_id)
@@ -133,19 +128,29 @@ defmodule LiveCollab.Viewport do
   @max_selected_id_length 255
 
   @doc """
-  Sanitizes and bounds an array of selected element or node IDs.
-  Limits length to at most 100 items, and truncates each ID string to at most 255 bytes.
-  Non-binary elements are discarded.
+  Sanitizes a client-supplied list of selected element or node IDs.
+
+  Keeps at most #{@max_selected_ids} entries. Entries that are not valid UTF-8
+  strings of 1..#{@max_selected_id_length} bytes are discarded (not truncated: a
+  truncated id would silently refer to a different element). Only the first
+  #{@max_selected_ids * 4} list items are inspected, so an oversized list costs
+  bounded work.
   """
   @spec sanitize_selected_ids(term()) :: [String.t()]
   def sanitize_selected_ids(selected_ids) when is_list(selected_ids) do
     selected_ids
-    |> Enum.filter(&is_binary/1)
-    |> Enum.map(&String.slice(&1, 0, @max_selected_id_length))
+    |> Enum.take(@max_selected_ids * 4)
+    |> Enum.filter(&valid_selected_id?/1)
     |> Enum.take(@max_selected_ids)
   end
 
   def sanitize_selected_ids(_), do: []
+
+  defp valid_selected_id?(id) when is_binary(id) do
+    byte_size(id) in 1..@max_selected_id_length and String.valid?(id)
+  end
+
+  defp valid_selected_id?(_), do: false
 
   @doc """
   Sanitizes and constructs a broadcast selection bounding box payload.
@@ -160,12 +165,7 @@ defmodule LiveCollab.Viewport do
           opts :: keyword()
         ) :: selection_payload()
   def build_selection_payload(client_id, user, x, y, width, height, opts \\ []) do
-    user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
-    user_name = Map.get(user, :name) || Map.get(user, "name") || "Collaborator"
-
-    user_color =
-      Map.get(user, :color) || Map.get(user, "color") ||
-        LiveCollab.Presence.deterministic_color(user_id)
+    {user_id, user_name, user_color} = LiveCollab.Presence.display_fields(user, client_id)
 
     container_id = Keyword.get(opts, :container_id)
     raw_selected_ids = Keyword.get(opts, :selected_ids, [])
@@ -186,25 +186,12 @@ defmodule LiveCollab.Viewport do
     }
   end
 
-  defp parse_number(val) when is_float(val) do
-    if is_finite(val), do: {:ok, val}, else: {:error, :non_finite_number}
-  end
-
-  defp parse_number(val) when is_integer(val) do
-    {:ok, val * 1.0}
-  end
-
-  defp parse_number(val) when is_binary(val) do
-    case Float.parse(val) do
-      {num, ""} -> parse_number(num)
-      _ -> {:error, :invalid_coordinate_format}
+  defp coordinate(value) do
+    case LiveCollab.Validation.number(value) do
+      {:ok, num} -> {:ok, num}
+      {:error, :invalid_number_type} -> {:error, :invalid_coordinate_type}
+      {:error, _} -> {:error, :invalid_coordinate_format}
     end
-  end
-
-  defp parse_number(_invalid), do: {:error, :invalid_coordinate_type}
-
-  defp is_finite(num) when is_float(num) do
-    not (num > 1.0e308 or num < -1.0e308 or num != num)
   end
 
   defp validate_scroll_bounds(x, y) do
@@ -232,4 +219,3 @@ defmodule LiveCollab.Viewport do
     end
   end
 end
-

@@ -1,16 +1,27 @@
 {
   "name": "live_collab",
-  "version": "0.4.0",
-  "description": "Client-side hooks and utilities for LiveCollab Phoenix LiveView library",
-  "main": "js/live_collab/index.js",
-  "module": "js/live_collab/index.js",
+  "version": "0.5.0",
+  "description": "Client-side hooks for the LiveCollab Phoenix LiveView library",
+  "type": "module",
+  "main": "./assets/js/live_collab/index.js",
+  "module": "./assets/js/live_collab/index.js",
+  "exports": {
+    ".": "./assets/js/live_collab/index.js"
+  },
+  "files": [
+    "assets/js/live_collab"
+  ],
+  "sideEffects": false,
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/HataluliRandima/live_collab.git"
   },
   "scripts": {
-    "build": "echo 'Pure ES module, no build step required'"
+    "test": "node --test \"assets/test/**/*.test.js\""
+  },
+  "devDependencies": {
+    "jsdom": "29.1.1"
   },
   "keywords": [
     "phoenix",

@@ -8,7 +8,16 @@ defmodule LiveCollab.Presence do
   - Presence metadata normalization
   - Atomic field lock updates
   - Shared element and row activity updates
+
+  ## Process identity
+
+  `Phoenix.Presence` tracks *processes*. Every function here that accepts
+  `pid_or_socket` resolves a LiveView socket to `self()`, so it must be called
+  from the LiveView process that owns the socket (which is always the case in
+  LiveView callbacks and lifecycle hooks). Pids are passed through unchanged.
   """
+
+  alias LiveCollab.Validation
 
   # 12 high-contrast, accessible, visually distinct hex colors for avatar badges
   @default_palette [
@@ -50,18 +59,15 @@ defmodule LiveCollab.Presence do
           extra_meta :: map()
         ) :: {:ok, binary()} | {:error, term()}
   def track(presence_module, pid_or_socket, topic, user, client_id, extra_meta \\ %{}) do
-    user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
-    user_name = Map.get(user, :name) || Map.get(user, "name") || "Guest"
-    avatar_url = Map.get(user, :avatar_url) || Map.get(user, "avatar_url")
-    color = Map.get(user, :color) || Map.get(user, "color") || deterministic_color(user_id)
+    identity = identity(user, client_id)
 
     meta =
       %{
         client_id: client_id,
-        user_id: user_id,
-        user_name: user_name,
-        user_avatar: avatar_url,
-        user_color: color,
+        user_id: identity.id,
+        user_name: identity.name,
+        user_avatar: identity.avatar_url,
+        user_color: identity.color,
         field: nil,
         acquired_at: 0,
         element: nil,
@@ -70,8 +76,79 @@ defmodule LiveCollab.Presence do
       }
       |> Map.merge(extra_meta)
 
-    presence_module.track(pid_or_socket, topic, to_string(user_id), meta)
+    presence_module.track(to_pid(pid_or_socket), topic, identity.key, meta)
   end
+
+  @typedoc "Normalized, display-safe identity derived from an application user map."
+  @type identity :: %{
+          id: term(),
+          key: String.t(),
+          name: String.t(),
+          avatar_url: String.t() | nil,
+          color: String.t()
+        }
+
+  @doc """
+  Derives the identity LiveCollab publishes for a user.
+
+  Accepts atom or string keys (`:id`, `:name`, `:avatar_url`, `:color`). Falls
+  back to `client_id` when the user has no id and to `"Guest"` when it has no
+  name. Colors that are not `#rgb`/`#rrggbb` are replaced by
+  `deterministic_color/1`; avatar URLs that are not `http(s)`, root-relative or
+  `data:image/` are dropped.
+  """
+  @spec identity(map(), String.t()) :: identity()
+  def identity(user, client_id) when is_map(user) do
+    id = user_field(user, :id) || client_id
+    name = user_field(user, :name)
+
+    avatar_url =
+      case Validation.avatar_url(user_field(user, :avatar_url)) do
+        {:ok, url} -> url
+        {:error, _} -> nil
+      end
+
+    %{
+      id: id,
+      key: to_string(id),
+      name: if(is_binary(name) and name != "", do: name, else: "Guest"),
+      avatar_url: avatar_url,
+      color: safe_color(user_field(user, :color), id)
+    }
+  end
+
+  @doc """
+  Returns `color` normalized to `#rrggbb` when it is a valid hex color, otherwise
+  the deterministic palette color for `identifier`.
+  """
+  @spec safe_color(term(), term()) :: String.t()
+  def safe_color(color, identifier) do
+    case Validation.color(color) do
+      {:ok, hex} -> hex
+      {:error, _} -> deterministic_color(identifier)
+    end
+  end
+
+  @doc false
+  # `{id, name, color}` for telemetry payloads. Accepts a raw user map or an
+  # `identity/2` map (both expose `:id`, `:name`, `:color`).
+  @spec display_fields(map(), String.t()) :: {term(), String.t(), String.t()}
+  def display_fields(user, client_id) when is_map(user) do
+    id = user_field(user, :id) || client_id
+    name = user_field(user, :name)
+    name = if is_binary(name) and name != "", do: name, else: "Collaborator"
+    {id, name, safe_color(user_field(user, :color), id)}
+  end
+
+  defp user_field(user, key) do
+    case Map.get(user, key) do
+      nil -> Map.get(user, Atom.to_string(key))
+      value -> value
+    end
+  end
+
+  defp to_pid(pid) when is_pid(pid), do: pid
+  defp to_pid(%Phoenix.LiveView.Socket{}), do: self()
 
   @doc """
   Untracks a process or socket from the collaborative presence topic.
@@ -83,7 +160,7 @@ defmodule LiveCollab.Presence do
           user_id :: term()
         ) :: :ok | {:ok, binary()} | {:error, term()}
   def untrack(presence_module, pid_or_socket, topic, user_id) do
-    presence_module.untrack(pid_or_socket, topic, to_string(user_id))
+    presence_module.untrack(to_pid(pid_or_socket), topic, to_string(user_id))
   end
 
   @doc """
@@ -100,7 +177,7 @@ defmodule LiveCollab.Presence do
   def update_field(presence_module, pid_or_socket, topic, user_id, field_id, client_id) do
     now = System.system_time(:millisecond)
 
-    presence_module.update(pid_or_socket, topic, to_string(user_id), fn existing_meta ->
+    presence_module.update(to_pid(pid_or_socket), topic, to_string(user_id), fn existing_meta ->
       acquired_at =
         cond do
           is_nil(field_id) ->
@@ -159,7 +236,7 @@ defmodule LiveCollab.Presence do
       ) do
     now = System.system_time(:millisecond)
 
-    presence_module.update(pid_or_socket, topic, to_string(user_id), fn existing_meta ->
+    presence_module.update(to_pid(pid_or_socket), topic, to_string(user_id), fn existing_meta ->
       acquired_at =
         cond do
           is_nil(element_id) ->
@@ -198,7 +275,7 @@ defmodule LiveCollab.Presence do
   end
 
   @doc """
-  Transforms raw `Phoenix.Presence.list/1` output into a list of structured `user_collab` maps.
+  Transforms raw `c:Phoenix.Presence.list/1` output into a list of structured `user_collab` maps.
 
   Consolidates multiple tabs for the same user while preserving tabs count, active fields,
   and active element locations.
@@ -209,6 +286,8 @@ defmodule LiveCollab.Presence do
       first_meta = hd(metas)
       name = Map.get(first_meta, :user_name, "User")
       avatar = Map.get(first_meta, :user_avatar)
+      # Colors are sanitized where they enter (track/6) and where they leave
+      # (components, JS hooks); extraction runs per rebuild, so it stays cheap.
       color = Map.get(first_meta, :user_color) || deterministic_color(user_id)
 
       active_fields =
@@ -257,10 +336,8 @@ defmodule LiveCollab.Presence do
   def initials(""), do: "?"
 
   def initials(name) when is_binary(name) do
-    parts =
-      name
-      |> String.trim()
-      |> String.split(~r/\s+/, trim: true)
+    # String.split/1 splits on Unicode whitespace and drops empty parts.
+    parts = String.split(name)
 
     case parts do
       [] ->

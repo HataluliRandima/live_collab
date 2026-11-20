@@ -93,14 +93,15 @@ defmodule LiveCollab.ViewportTest do
       assert payload.selected_ids == ["card_1", "card_2"]
     end
 
-    test "sanitizes, truncates, and bounds selected_ids to prevent memory exhaustion" do
+    test "sanitizes and bounds selected_ids to prevent memory exhaustion" do
       user = %{id: "user_1", name: "Alice"}
       client_id = "cli_alice"
 
       # 500 items, some non-binary, some over 255 bytes
       oversized_id = String.duplicate("x", 500)
+
       huge_list =
-        [oversized_id, 12345, %{"bad" => "map"}, nil, "valid_card"] ++
+        [oversized_id, 12_345, %{"bad" => "map"}, nil, "valid_card"] ++
           Enum.map(1..495, fn i -> "item_#{i}" end)
 
       payload =
@@ -111,10 +112,11 @@ defmodule LiveCollab.ViewportTest do
       # Must cap at 100 items
       assert length(payload.selected_ids) == 100
 
-      # First item must be sliced to 255 bytes
-      first_item = hd(payload.selected_ids)
-      assert byte_size(first_item) == 255
-      assert first_item == String.duplicate("x", 255)
+      # Oversized ids are dropped rather than truncated: a truncated id would
+      # silently refer to a different element.
+      refute oversized_id in payload.selected_ids
+      refute Enum.any?(payload.selected_ids, &(byte_size(&1) > 255))
+      assert hd(payload.selected_ids) == "valid_card"
 
       # Non-binary items (integer, map, nil) must be stripped
       refute Enum.any?(payload.selected_ids, fn id -> not is_binary(id) end)

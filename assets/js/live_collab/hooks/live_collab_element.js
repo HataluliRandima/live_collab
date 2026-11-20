@@ -1,58 +1,40 @@
 /**
  * LiveCollab - Collaborative Element & Row Hook
  *
- * Provides real-time activity indicators for table rows, cards, and sections.
+ * Activity indicators for table rows, cards and sections.
  *
- * Features:
- * - Immediate activation on click and keyboard focus (`focusin`)
- * - Configurable Hover Intent debounce to prevent mouse-movement diff storms
- * - Tab/window isolation using shared tab client ID
- * - Accessible ARIA state reflection
- * - Clean lifecycle disposal on destroy or navigation
+ * - `click` marks the element `selected`; keyboard focus (`focusin`) marks it `viewing`
+ * - Optional hover intent (`data-collab-hover-intent="300"`) debounces mouse
+ *   travel so sweeping across a table does not write to Presence for every row
+ * - Releases name the element they release, so a late release from the
+ *   previous row never clears the current one
  */
 
-function getTabClientId() {
-  const KEY = "live_collab_tab_id";
-  try {
-    let id = window.sessionStorage.getItem(KEY);
-    if (!id) {
-      id = typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-      window.sessionStorage.setItem(KEY, id);
-    }
-    return id;
-  } catch (_e) {
-    return "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-  }
-}
+import { safePush } from "../utils.js";
 
 export const LiveCollabElement = {
   mounted() {
-    this.clientId = getTabClientId();
-    this.elementId = this.el.dataset.collabElement || this.el.id;
+    this.elementId = this.readElementId();
     this.type = this.el.dataset.collabType || "viewing";
     this.hoverIntentMs = parseInt(this.el.dataset.collabHoverIntent, 10) || null;
     this.hoverTimer = null;
-    this.isActive = false;
+    this.activeType = null;
 
     if (!this.elementId) {
-      console.warn("[LiveCollab] Hook mounted on element without data-collab-element or id:", this.el);
+      console.warn("[LiveCollab] LiveCollabElement mounted without data-collab-element or id:", this.el);
       return;
     }
 
-    this.handleClick = this.handleClick.bind(this);
-    this.handleFocusIn = this.handleFocusIn.bind(this);
+    this.handleClick = () => this.activateElement("selected");
+    this.handleFocusIn = () => this.activateElement("viewing");
     this.handleFocusOut = this.handleFocusOut.bind(this);
     this.handleMouseEnter = this.handleMouseEnter.bind(this);
     this.handleMouseLeave = this.handleMouseLeave.bind(this);
 
-    // Primary interaction triggers
     this.el.addEventListener("click", this.handleClick);
     this.el.addEventListener("focusin", this.handleFocusIn);
     this.el.addEventListener("focusout", this.handleFocusOut);
 
-    // Hover intent handling (only if explicitly enabled)
     if (this.hoverIntentMs && this.hoverIntentMs > 0) {
       this.el.addEventListener("mouseenter", this.handleMouseEnter);
       this.el.addEventListener("mouseleave", this.handleMouseLeave);
@@ -60,79 +42,65 @@ export const LiveCollabElement = {
   },
 
   updated() {
-    const newElementId = this.el.dataset.collabElement || this.el.id;
+    const newElementId = this.readElementId();
     if (newElementId !== this.elementId) {
+      this.deactivateElement();
       this.elementId = newElementId;
     }
     this.type = this.el.dataset.collabType || "viewing";
   },
 
   destroyed() {
+    if (!this.handleClick) return;
     this.clearTimers();
     this.el.removeEventListener("click", this.handleClick);
     this.el.removeEventListener("focusin", this.handleFocusIn);
     this.el.removeEventListener("focusout", this.handleFocusOut);
     this.el.removeEventListener("mouseenter", this.handleMouseEnter);
     this.el.removeEventListener("mouseleave", this.handleMouseLeave);
-
-    if (this.isActive) {
-      this.pushEvent("live_collab:element_inactive", {
-        element: this.elementId,
-        client_id: this.clientId
-      });
-      this.isActive = false;
-    }
+    this.deactivateElement();
   },
 
-  handleClick(_event) {
-    this.activateElement("selected");
-  },
-
-  handleFocusIn(_event) {
-    this.activateElement("viewing");
+  readElementId() {
+    return this.el.dataset.collabElement || this.el.id || null;
   },
 
   handleFocusOut(event) {
-    // If focus moves to another child within this same element, remain active
-    if (this.el.contains(event.relatedTarget)) {
-      return;
-    }
-
+    if (this.el.contains(event.relatedTarget)) return;
     this.deactivateElement();
   },
 
   handleMouseEnter(_event) {
     this.clearTimers();
     this.hoverTimer = setTimeout(() => {
-      this.activateElement("viewing");
       this.hoverTimer = null;
+      this.activateElement("viewing");
     }, this.hoverIntentMs);
   },
 
   handleMouseLeave(_event) {
     this.clearTimers();
-    // Only deactivate on mouseleave if it was activated via hover (not keyboard focus)
-    if (this.isActive && !this.el.contains(document.activeElement)) {
+    if (this.activeType && !this.el.contains(document.activeElement)) {
       this.deactivateElement();
     }
   },
 
   activateElement(type) {
-    this.isActive = true;
-    this.pushEvent("live_collab:element_active", {
-      element: this.elementId,
-      type: type || this.type,
-      client_id: this.clientId
-    });
+    const nextType = type || this.type;
+    // Never downgrade a click-selection to "viewing" from a hover or focus.
+    if (this.activeType === nextType || (this.activeType === "selected" && nextType === "viewing")) {
+      return;
+    }
+
+    if (safePush(this, "live_collab:element_active", { element: this.elementId, type: nextType })) {
+      this.activeType = nextType;
+    }
   },
 
   deactivateElement() {
-    if (this.isActive) {
-      this.isActive = false;
-      this.pushEvent("live_collab:element_inactive", {
-        element: this.elementId,
-        client_id: this.clientId
-      });
+    if (this.activeType) {
+      this.activeType = null;
+      safePush(this, "live_collab:element_inactive", { element: this.elementId });
     }
   },
 
@@ -145,4 +113,3 @@ export const LiveCollabElement = {
 };
 
 export default LiveCollabElement;
-

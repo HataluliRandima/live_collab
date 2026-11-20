@@ -154,4 +154,50 @@ defmodule LiveCollab.ComponentsTest do
       assert Keyword.get(attrs, :"data-collab-container") == "artboard_1"
     end
   end
+
+  describe "follow_pill/1" do
+    import Phoenix.LiveViewTest, only: [render_component: 2]
+
+    test "uses JS.dispatch instead of inline JavaScript (CSP-safe, no injection)" do
+      html =
+        render_component(&Components.follow_pill/1,
+          leader_name: "Ann",
+          leader_client_id: "cli_x');alert(1);//",
+          leader_color: "#123456"
+        )
+
+      refute html =~ "onclick"
+      assert html =~ "phx-click"
+      assert html =~ "live_collab:start_follow"
+    end
+  end
+
+  describe "color sanitization in rendered markup" do
+    import Phoenix.LiveViewTest, only: [render_component: 2]
+
+    test "avatar colors cannot inject CSS" do
+      user = %{
+        id: "u",
+        name: "Ann",
+        avatar_url: nil,
+        initials: "AN",
+        tabs_count: 1,
+        color: "red; background-image: url(https://evil.example)"
+      }
+
+      html = render_component(&Components.avatar/1, user: user)
+
+      refute html =~ "evil.example"
+      assert html =~ ~r/background-color: #[0-9A-F]{6};/
+    end
+
+    test "collab_row_attrs/4 sanitizes the CSS variable color" do
+      activities = %{
+        "row:1" => [%{client_id: "x", user_name: "Ann", user_color: "x;}*{}", type: :viewing}]
+      }
+
+      style = Components.collab_row_attrs("row:1", activities, "me") |> Keyword.get(:style)
+      assert style =~ ~r/\A--collab-element-color: #[0-9A-F]{6};\z/
+    end
+  end
 end

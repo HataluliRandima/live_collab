@@ -44,29 +44,14 @@ defmodule LiveCollab.Element do
   @spec validate_element_id(term(), pos_integer()) :: {:ok, String.t()} | {:error, atom()}
   def validate_element_id(element_id, max_length \\ 255)
 
-  def validate_element_id(element_id, max_length) when is_binary(element_id) do
-    cond do
-      byte_size(element_id) == 0 ->
-        {:error, :empty_element_id}
-
-      byte_size(element_id) > max_length ->
-        {:error, :element_id_too_long}
-
-      not String.valid?(element_id) ->
-        {:error, :invalid_encoding}
-
-      String.contains?(element_id, "..") ->
-        {:error, :disallowed_characters}
-
-      Regex.match?(~r/^[a-zA-Z0-9_\.\-:\/\[\]]+$/, element_id) ->
-        {:ok, element_id}
-
-      true ->
-        {:error, :disallowed_characters}
+  def validate_element_id(element_id, max_length) do
+    case LiveCollab.Validation.identifier(element_id, max_length) do
+      {:ok, id} -> {:ok, id}
+      {:error, :empty} -> {:error, :empty_element_id}
+      {:error, :too_long} -> {:error, :element_id_too_long}
+      {:error, reason} -> {:error, reason}
     end
   end
-
-  def validate_element_id(_invalid, _max_length), do: {:error, :invalid_type}
 
   @doc """
   Normalizes an activity type atom or string into one of `:viewing`, `:selected`, or `:editing`.
@@ -82,7 +67,7 @@ defmodule LiveCollab.Element do
   def normalize_activity_type(_other), do: :viewing
 
   @doc """
-  Given raw presence entries from `Phoenix.Presence.list/1`, extracts all active
+  Given raw presence entries from `c:Phoenix.Presence.list/1`, extracts all active
   element activities, grouping collaborators by element ID.
 
   Consolidates multi-tab sessions for the same user while preserving the highest
@@ -110,8 +95,7 @@ defmodule LiveCollab.Element do
           user_id: Map.get(meta, :user_id, ""),
           user_name: Map.get(meta, :user_name, "User"),
           user_avatar: Map.get(meta, :user_avatar),
-          user_color:
-            Map.get(meta, :user_color) || Presence.deterministic_color(meta[:user_id]),
+          user_color: Map.get(meta, :user_color) || Presence.deterministic_color(meta[:user_id]),
           type: type,
           field: Map.get(meta, :field),
           acquired_at: Map.get(meta, :element_acquired_at, 0)
@@ -128,16 +112,7 @@ defmodule LiveCollab.Element do
 
     if dedup_users do
       Enum.into(grouped, %{}, fn {element, activities} ->
-        consolidated =
-          activities
-          |> Enum.group_by(& &1.user_id)
-          |> Enum.map(fn {_uid, user_activities} ->
-            # Pick highest precedence activity for this user on this element
-            Enum.max_by(user_activities, &activity_precedence(&1.type))
-          end)
-          |> Enum.sort_by(&{&1.type != :editing, &1.acquired_at})
-
-        {element, consolidated}
+        {element, consolidate_by_user(activities)}
       end)
     else
       Enum.into(grouped, %{}, fn {element, activities} ->
@@ -182,10 +157,19 @@ defmodule LiveCollab.Element do
     end
   end
 
+  # One entry per user (multi-tab): the highest-precedence activity wins.
+  defp consolidate_by_user(activities) do
+    activities
+    |> Enum.group_by(& &1.user_id)
+    |> Enum.map(fn {_uid, user_activities} ->
+      Enum.max_by(user_activities, &activity_precedence(&1.type))
+    end)
+    |> Enum.sort_by(&{&1.type != :editing, &1.acquired_at})
+  end
+
   # Precedence: :editing (3) > :selected (2) > :viewing (1)
   defp activity_precedence(:editing), do: 3
   defp activity_precedence(:selected), do: 2
   defp activity_precedence(:viewing), do: 1
   defp activity_precedence(_), do: 0
 end
-
