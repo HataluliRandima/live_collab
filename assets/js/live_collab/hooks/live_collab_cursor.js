@@ -13,7 +13,16 @@
  * injected into this page.
  */
 
-import { departedClientIds, finite, matchesContainer, safeColor, safeName, safePush } from "../utils.js";
+import {
+  adoptLayer,
+  departedClientIds,
+  ensureLayerAttached,
+  finite,
+  matchesContainer,
+  safeColor,
+  safeName,
+  safePush
+} from "../utils.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 const POINTER_PATH = "M5.65376 12.3673H5.46026L5.31717 12.4976L0.500002 16.8829L0.500002 1.19841L11.7841 12.3673H5.65376Z";
@@ -38,11 +47,9 @@ export const LiveCollabCursor = {
       this.el.style.position = "relative";
     }
 
-    this.cursorLayer = document.createElement("div");
-    this.cursorLayer.className =
-      "live-collab-cursor-layer pointer-events-none absolute inset-0 overflow-hidden z-50 select-none";
-    this.cursorLayer.setAttribute("aria-hidden", "true");
-    this.el.appendChild(this.cursorLayer);
+    const { layer, owned } = adoptLayer(this.el, "live-collab-cursor-layer z-50");
+    this.cursorLayer = layer;
+    this.ownsLayer = owned;
 
     this.handlePointerMove = this.handlePointerMove.bind(this);
     this.handlePointerLeave = this.handlePointerLeave.bind(this);
@@ -64,13 +71,17 @@ export const LiveCollabCursor = {
     });
   },
 
+  updated() {
+    if (this.ownsLayer) ensureLayerAttached(this.el, this.cursorLayer);
+  },
+
   destroyed() {
     this.stopLoop();
     this.el.removeEventListener("pointermove", this.handlePointerMove);
     this.el.removeEventListener("pointerleave", this.handlePointerLeave);
 
     this.remoteCursors.forEach((_cursor, clientId) => this.removeRemoteCursor(clientId));
-    if (this.cursorLayer) this.cursorLayer.remove();
+    if (this.ownsLayer && this.cursorLayer) this.cursorLayer.remove();
 
     safePush(this, "live_collab:cursor_left", { container_id: this.containerId });
   },
@@ -106,6 +117,11 @@ export const LiveCollabCursor = {
     const el = document.createElement("div");
     el.className = "live-collab-remote-cursor absolute top-0 left-0 transition-opacity duration-200";
     el.style.willChange = "transform";
+    // Positioning must not depend on the app's CSS framework.
+    el.style.position = "absolute";
+    el.style.top = "0";
+    el.style.left = "0";
+    el.style.transition = "opacity 200ms";
 
     const svg = document.createElementNS(SVG_NS, "svg");
     svg.setAttribute("width", "22");
@@ -124,6 +140,7 @@ export const LiveCollabCursor = {
     pill.className =
       "live-collab-cursor-pill inline-block px-1.5 py-0.5 rounded text-[11px] font-semibold text-white whitespace-nowrap shadow-sm ml-3.5 -mt-2";
     pill.style.backgroundColor = color;
+    pill.style.color = "#fff";
     pill.textContent = name;
 
     el.appendChild(svg);

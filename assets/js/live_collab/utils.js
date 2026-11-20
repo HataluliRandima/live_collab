@@ -53,3 +53,31 @@ export function departedClientIds(payload) {
     ? payload.client_ids.filter((id) => typeof id === "string")
     : [];
 }
+
+/**
+ * Returns the overlay a hook draws into.
+ *
+ * Prefers a server-rendered `[data-collab-layer]` child (rendered with
+ * phx-update="ignore", so LiveView keeps it and its contents). Otherwise
+ * creates one; LiveView may discard such a node when it patches the container,
+ * so hooks call `ensureLayerAttached` from `updated()`.
+ */
+export function adoptLayer(el, className) {
+  const existing = Array.from(el.children).find((child) => child.hasAttribute("data-collab-layer"));
+  if (existing) return { layer: existing, owned: false };
+
+  const layer = document.createElement("div");
+  layer.className = `${className} pointer-events-none absolute inset-0 overflow-hidden select-none`;
+  layer.setAttribute("aria-hidden", "true");
+  layer.style.position = "absolute";
+  layer.style.inset = "0";
+  layer.style.pointerEvents = "none";
+  layer.style.overflow = "hidden";
+  el.appendChild(layer);
+  return { layer, owned: true };
+}
+
+/** Re-appends a hook-created layer that a LiveView patch removed. */
+export function ensureLayerAttached(el, layer) {
+  if (layer && layer.parentNode !== el) el.appendChild(layer);
+}

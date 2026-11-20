@@ -101,14 +101,24 @@ defmodule LiveCollab.Components do
 
   def avatar(assigns) do
     tabs_count = Map.get(assigns.user, :tabs_count, 1)
-    assigns = assign(assigns, :tabs_count, tabs_count)
+    away? = Map.get(assigns.user, :status) == :away
+
+    assigns =
+      assigns
+      |> assign(:tabs_count, tabs_count)
+      |> assign(:away?, away?)
+      |> assign(:away_label, if(away?, do: " (away)", else: ""))
 
     ~H"""
     <div
-      class="relative group focus:outline-none"
+      class={[
+        "relative group focus:outline-none transition-opacity",
+        @away? && "live-collab-away opacity-40 grayscale"
+      ]}
       tabindex="0"
-      aria-label={"Collaborator #{@user.name}"}
-      title={"#{@user.name}#{if @tabs_count > 1, do: " (#{@tabs_count} tabs)", else: ""}"}
+      data-collab-status={if @away?, do: "away", else: "active"}
+      aria-label={"Collaborator #{@user.name}#{@away_label}"}
+      title={"#{@user.name}#{@away_label}#{if @tabs_count > 1, do: " (#{@tabs_count} tabs)", else: ""}"}
     >
       <%= if @user.avatar_url do %>
         <img
@@ -362,6 +372,32 @@ defmodule LiveCollab.Components do
   end
 
   @doc """
+  Reports this tab's away/idle status to collaborators.
+
+  Render it once per LiveView that calls `LiveCollab.track/4`. The
+  `LiveCollabStatus` hook marks the tab `:away` when the page is hidden (another
+  tab or a minimised window) or after `idle_after` milliseconds without pointer,
+  keyboard, touch or scroll activity, and `:active` again on the next
+  interaction. Only changes are sent.
+
+  `@collab_users` then carries `status: :active | :away` per user (away only if
+  every tab of that user is away), and `<.avatar_stack>` dims away users.
+
+  ## Examples
+
+      <.status_reporter />
+      <.status_reporter idle_after={30_000} />
+  """
+  attr :idle_after, :integer, default: 60_000, doc: "Milliseconds of inactivity before away"
+  attr :id, :string, default: "live-collab-status", doc: "DOM id (required by LiveView hooks)"
+
+  def status_reporter(assigns) do
+    ~H"""
+    <div id={@id} phx-hook="LiveCollabStatus" data-collab-idle-after={@idle_after} hidden></div>
+    """
+  end
+
+  @doc """
   Renders a high-performance collaborative cursor container layer.
   Attaches `phx-hook="LiveCollabCursor"` and prepares the hardware-accelerated SVG overlay.
 
@@ -390,12 +426,20 @@ defmodule LiveCollab.Components do
   slot :inner_block, required: false
 
   def cursor_layer(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :dom_id,
+        assigns.id || hook_dom_id("live-collab-cursor", assigns.container_id)
+      )
+
     ~H"""
     <div
       class={["live-collab-cursor-container relative", @class]}
-      {collab_cursor_attrs(@container_id, throttle: @throttle, deadband: @deadband, id: @id)}
+      {collab_cursor_attrs(@container_id, throttle: @throttle, deadband: @deadband, id: @dom_id)}
     >
-      <%= render_slot(@inner_block) %>
+      {render_slot(@inner_block)}
+      <.overlay id={"#{@dom_id}-layer"} class="live-collab-cursor-layer z-50" />
     </div>
     """
   end
@@ -417,6 +461,11 @@ defmodule LiveCollab.Components do
 
   attr :following, :string, default: nil, doc: "Client ID of presenter to follow"
   attr :throttle, :integer, default: 40, doc: "Scroll broadcast throttle in milliseconds"
+
+  attr :auto_follow, :boolean,
+    default: false,
+    doc: "Automatically follow whoever starts presenting (manual scrolling breaks out)"
+
   attr :class, :string, default: nil
 
   attr :id, :string,
@@ -433,6 +482,7 @@ defmodule LiveCollab.Components do
         presenter: @presenter,
         following: @following,
         throttle: @throttle,
+        auto_follow: @auto_follow,
         id: @id
       )}
     >
@@ -511,12 +561,57 @@ defmodule LiveCollab.Components do
   slot :inner_block, required: false
 
   def selection_layer(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :dom_id,
+        assigns.id || hook_dom_id("live-collab-selection", assigns.container_id)
+      )
+
     ~H"""
     <div
       class={["live-collab-selection-container relative", @class]}
-      {collab_selection_attrs(@container_id, id: @id)}
+      {collab_selection_attrs(@container_id, id: @dom_id)}
     >
-      <%= render_slot(@inner_block) %>
+      {render_slot(@inner_block)}
+      <.overlay id={"#{@dom_id}-layer"} class="live-collab-selection-layer z-40" />
+    </div>
+    """
+  end
+
+  @doc """
+  Renders the overlay a `LiveCollabCursor` or `LiveCollabSelection` hook draws
+  into.
+
+  `<.cursor_layer>` and `<.selection_layer>` include one automatically. When you
+  attach a hook to your own element with `collab_cursor_attrs/2` or
+  `collab_selection_attrs/2`, render one as a direct child:
+
+      <div {collab_cursor_attrs("board")}>
+        ...
+        <LiveCollab.Components.overlay id="board-cursors" />
+      </div>
+
+  The overlay has `phx-update="ignore"`, so LiveView keeps it, and the cursors
+  drawn into it, across re-renders. Without it the hook creates its own overlay
+  and re-attaches it after LiveView patches remove it.
+  """
+  attr :id, :string, required: true
+  attr :class, :string, default: nil
+
+  def overlay(assigns) do
+    ~H"""
+    <div
+      id={@id}
+      phx-update="ignore"
+      data-collab-layer
+      aria-hidden="true"
+      class={[
+        "pointer-events-none absolute inset-0 overflow-hidden select-none",
+        @class
+      ]}
+      style="position: absolute; inset: 0; pointer-events: none; overflow: hidden;"
+    >
     </div>
     """
   end
@@ -556,6 +651,7 @@ defmodule LiveCollab.Components do
   - `presenter` - Boolean indicating if this client broadcasts scroll coordinates (default `false`).
   - `following` - Client ID string of presenter currently being followed.
   - `throttle` - Milliseconds between scroll broadcasts (default `40`).
+  - `auto_follow` - Follow a presenter automatically when a spotlight starts (default `false`).
   LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
   included, derived from the identifier (pass `id: "..."` to choose your own, or
   `id: false` if the element already sets one).
@@ -573,7 +669,11 @@ defmodule LiveCollab.Components do
           "data-collab-container": container_id,
           "data-collab-presenter": to_string(presenter),
           "data-collab-throttle": to_string(throttle)
-        ]
+        ] ++
+        if(Keyword.get(opts, :auto_follow, false),
+          do: ["data-collab-auto-follow": "true"],
+          else: []
+        )
 
     attrs =
       if following do
@@ -732,10 +832,12 @@ defmodule LiveCollab.Components do
   defp hook_id(prefix, raw, opts) do
     case Keyword.get(opts, :id) do
       false -> []
-      nil -> [id: prefix <> "-" <> dom_safe(to_string(raw))]
+      nil -> [id: hook_dom_id(prefix, raw)]
       id -> [id: to_string(id)]
     end
   end
+
+  defp hook_dom_id(prefix, raw), do: prefix <> "-" <> dom_safe(to_string(raw))
 
   defp dom_safe(value) do
     for <<byte <- value>>, into: "" do

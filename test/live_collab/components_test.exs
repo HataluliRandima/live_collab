@@ -232,4 +232,52 @@ defmodule LiveCollab.ComponentsTest do
       refute Keyword.has_key?(Components.collab_attrs("f", %{}, nil, id: false), :id)
     end
   end
+
+  describe "away status rendering" do
+    import Phoenix.LiveViewTest, only: [render_component: 2]
+
+    test "away users are dimmed and labelled" do
+      user = %{
+        id: "u",
+        name: "Ann",
+        avatar_url: nil,
+        initials: "AN",
+        tabs_count: 1,
+        color: "#123456"
+      }
+
+      away = render_component(&Components.avatar/1, user: Map.put(user, :status, :away))
+      active = render_component(&Components.avatar/1, user: Map.put(user, :status, :active))
+
+      assert away =~ "live-collab-away"
+      assert away =~ ~s|aria-label="Collaborator Ann (away)"|
+      refute active =~ "live-collab-away"
+    end
+
+    test "status_reporter renders a hook element with an id" do
+      html = render_component(&Components.status_reporter/1, idle_after: 5_000)
+      assert html =~ ~s(phx-hook="LiveCollabStatus")
+      assert html =~ ~s(id="live-collab-status")
+      assert html =~ ~s(data-collab-idle-after="5000")
+    end
+  end
+
+  describe "overlays" do
+    import Phoenix.LiveViewTest, only: [render_component: 2]
+
+    test "cursor and selection layers render an ignored overlay LiveView will not discard" do
+      for {fun, prefix} <- [
+            {&Components.cursor_layer/1, "live-collab-cursor-board"},
+            {&Components.selection_layer/1, "live-collab-selection-board"}
+          ] do
+        html = render_component(fun, container_id: "board", inner_block: [])
+
+        overlay =
+          html |> LazyHTML.from_fragment() |> LazyHTML.query("[data-collab-layer]")
+
+        assert LazyHTML.attribute(overlay, "id") == ["#{prefix}-layer"]
+        assert LazyHTML.attribute(overlay, "phx-update") == ["ignore"]
+      end
+    end
+  end
 end

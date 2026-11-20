@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { setupDom, element, mountHook } from "./harness.js";
 
 let env;
-let LiveCollabCursor, LiveCollabField, LiveCollabElement, LiveCollabViewport, LiveCollabSelection, LiveCollabHooks;
+let LiveCollabCursor, LiveCollabField, LiveCollabElement, LiveCollabViewport, LiveCollabSelection, LiveCollabStatus, LiveCollabHooks;
 
 beforeEach(async () => {
   env = setupDom();
-  ({ LiveCollabCursor, LiveCollabField, LiveCollabElement, LiveCollabViewport, LiveCollabSelection, LiveCollabHooks } =
+  ({ LiveCollabCursor, LiveCollabField, LiveCollabElement, LiveCollabViewport, LiveCollabSelection, LiveCollabStatus, LiveCollabHooks } =
     await import("../js/live_collab/index.js"));
 });
 
@@ -28,6 +28,7 @@ describe("package entry point", () => {
       "LiveCollabElement",
       "LiveCollabField",
       "LiveCollabSelection",
+      "LiveCollabStatus",
       "LiveCollabViewport"
     ]);
   });
@@ -419,3 +420,112 @@ describe("LiveCollabSelection", () => {
     assert.equal(h.pushes.length, 0);
   });
 });
+
+describe("LiveCollabStatus", () => {
+  const setVisibility = (state) => {
+    Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+    document.dispatchEvent(new env.window.Event("visibilitychange"));
+  };
+
+  test("goes away after the idle timeout and back on activity, pushing only changes", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const el = element("div", { "data-collab-idle-after": "1000" });
+    const h = mountHook(LiveCollabStatus, el);
+
+    t.mock.timers.tick(999);
+    assert.equal(h.pushes.length, 0);
+    t.mock.timers.tick(1);
+    env.window.dispatchEvent(new env.window.Event("pointermove"));
+    env.window.dispatchEvent(new env.window.Event("pointermove"));
+    env.window.dispatchEvent(new env.window.Event("keydown"));
+
+    assert.deepEqual(
+      h.pushes.map((p) => p.payload.status),
+      ["away", "active"]
+    );
+  });
+
+  test("activity keeps postponing the idle timer", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const h = mountHook(LiveCollabStatus, element("div", { "data-collab-idle-after": "1000" }));
+
+    for (let i = 0; i < 5; i++) {
+      t.mock.timers.tick(900);
+      env.window.dispatchEvent(new env.window.Event("wheel"));
+    }
+    assert.equal(h.pushes.length, 0);
+  });
+
+  test("a hidden page is away immediately and active when visible again", () => {
+    const h = mountHook(LiveCollabStatus, element("div"));
+    setVisibility("hidden");
+    setVisibility("visible");
+    assert.deepEqual(
+      h.events("live_collab:status").map((p) => p.payload),
+      [{ status: "away" }, { status: "active" }]
+    );
+    setVisibility("visible");
+  });
+
+  test("re-announces away after a reconnect", () => {
+    const h = mountHook(LiveCollabStatus, element("div"));
+    setVisibility("hidden");
+    h.hook.reconnected();
+    assert.deepEqual(
+      h.pushes.map((p) => p.payload.status),
+      ["away", "away"]
+    );
+    setVisibility("visible");
+  });
+
+  test("destroyed() removes window and document listeners", () => {
+    const winAdd = mock.method(env.window, "addEventListener");
+    const winRemove = mock.method(env.window, "removeEventListener");
+    const h = mountHook(LiveCollabStatus, element("div"));
+    h.hook.destroyed();
+    assert.equal(winRemove.mock.callCount(), winAdd.mock.callCount());
+    env.window.dispatchEvent(new env.window.Event("keydown"));
+    assert.equal(h.pushes.length, 0);
+  });
+});
+
+describe("overlay layers survive LiveView patches", () => {
+  test("hooks adopt a server-rendered [data-collab-layer] overlay and leave it in place on destroy", () => {
+    const el = element("div", { "data-collab-container": "board" });
+    const overlay = document.createElement("div");
+    overlay.setAttribute("data-collab-layer", "");
+    overlay.setAttribute("phx-update", "ignore");
+    el.appendChild(overlay);
+
+    const h = mountHook(LiveCollabCursor, el);
+    h.server("live_collab:cursor_moved", remoteCursor());
+
+    assert.equal(el.children.length, 1, "no second layer created");
+    assert.equal(overlay.querySelectorAll(".live-collab-remote-cursor").length, 1);
+    h.hook.destroyed();
+    assert.equal(overlay.isConnected, true);
+  });
+
+  test("regression: a hook-created layer removed by a LiveView patch is re-attached with its cursors", () => {
+    const el = element("div", { "data-collab-container": "board" });
+    const h = mountHook(LiveCollabCursor, el);
+    h.server("live_collab:cursor_moved", remoteCursor());
+    const layer = el.querySelector(".live-collab-cursor-layer");
+
+    layer.remove(); // what morphdom does to children the server did not render
+    h.hook.updated();
+
+    assert.equal(layer.parentNode, el);
+    assert.equal(el.querySelectorAll(".live-collab-remote-cursor").length, 1);
+  });
+
+  test("the selection hook re-attaches its layer too", () => {
+    const el = element("div", { "data-collab-container": "canvas" });
+    const h = mountHook(LiveCollabSelection, el);
+    const layer = el.querySelector(".live-collab-selection-layer");
+    layer.remove();
+    h.hook.updated();
+    assert.equal(layer.parentNode, el);
+  });
+});
+

@@ -37,6 +37,11 @@ recommended. See `guides/guarantees.md` for what LiveCollab does and does not gu
 - No hook could mount in a real browser: LiveView requires a DOM `id` on every
   `phx-hook` element, and none of the helpers or components rendered one. They
   now emit a deterministic id (override with `id: "..."`, omit with `id: false`).
+- Cursor and selection overlays appended by the hooks were discarded by the next
+  LiveView re-render. Components now render the overlay with
+  `phx-update="ignore"` (new `<.overlay>` for custom containers), and hooks
+  re-attach a self-created overlay after a patch. Hook-drawn elements no longer
+  depend on Tailwind classes for positioning.
 
 ### Changed
 - High-frequency events no longer re-render the sender: rate-limiter state moved
@@ -54,6 +59,10 @@ recommended. See `guides/guarantees.md` for what LiveCollab does and does not gu
 - Requires Elixir `~> 1.15` and `phoenix_live_view ~> 1.0`.
 
 ### Added
+- Away / idle status: `<.status_reporter>` and the `LiveCollabStatus` hook mark a
+  tab away when hidden or idle; `@collab_users` carries `status`; avatars dim away
+  users; `[:live_collab, :status, :changed]` telemetry.
+- `auto_follow` attribute on `<.viewport_container>`.
 - `LiveCollab.Telemetry`: events for sessions, presence rebuilds, locks, rate-limited
   and rejected events, and spotlight; `attach_default_logger/1`.
 - `live_collab:peers_left` push event; immediate `lock_lost` when focusing a held field;

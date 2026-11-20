@@ -61,6 +61,7 @@ defmodule LiveCollab.LiveView do
   | `viewport_move` | telemetry | relay scroll position to peers |
   | `selection_move` / `selection_clear` | telemetry | relay selection box to peers |
   | `spotlight_lead` / `spotlight_stop` | telemetry | presenter mode (authorized) |
+  | `status` (`"active"` / `"away"`) | presence | away/idle status shown on avatars |
 
   Releases (`field_blur`, `element_inactive`) are never rate limited, but they
   only write to Presence when there is something to release. A blur that names a
@@ -114,6 +115,7 @@ defmodule LiveCollab.LiveView do
       :telemetry_limiter,
       :presence_limiter,
       active_type: nil,
+      status: :active,
       sync_pending: false,
       last_sync_at: nil,
       # Local replica of this topic's Presence entries, kept current by applying
@@ -642,6 +644,32 @@ defmodule LiveCollab.LiveView do
     end)
   end
 
+  # --- Away / idle status -------------------------------------------------------
+
+  defp handle_client_event("status", %{"status" => raw}, socket, session) do
+    case parse_status(raw) do
+      {:ok, status} when status == session.status ->
+        socket
+
+      {:ok, status} ->
+        rate_limited(socket, session, :presence, "status", fn socket, session ->
+          Presence.update_status(
+            session.presence,
+            self(),
+            session.topic,
+            session.user_key,
+            status
+          )
+
+          Telemetry.execute([:status, :changed], %{}, Map.put(meta(session), :status, status))
+          put_session(socket, %{session | status: status})
+        end)
+
+      :error ->
+        reject(socket, session, "status", :invalid_status)
+    end
+  end
+
   # Known event with missing/ill-typed params, or an unknown live_collab:* event.
   defp handle_client_event(event, _params, socket, session) do
     reason = if event in known_events(), do: :invalid_params, else: :unknown_event
@@ -650,8 +678,12 @@ defmodule LiveCollab.LiveView do
 
   defp known_events do
     ~w(field_focus field_blur element_active element_inactive cursor_move cursor_left
-       viewport_move selection_move selection_clear spotlight_lead spotlight_stop)
+       viewport_move selection_move selection_clear spotlight_lead spotlight_stop status)
   end
+
+  defp parse_status("active"), do: {:ok, :active}
+  defp parse_status("away"), do: {:ok, :away}
+  defp parse_status(_), do: :error
 
   # ============================================================================
   # handle_info hook

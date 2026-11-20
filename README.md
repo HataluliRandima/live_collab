@@ -22,6 +22,7 @@ works across a clustered deployment.
 | Feature | Transport | Server pieces | Client hook |
 | :--- | :--- | :--- | :--- |
 | Presence and avatar stack (multi-tab aware) | Presence | `@collab_users`, `<.avatar_stack>` | none |
+| Away / idle status | Presence | `<.status_reporter>`, `status` in `@collab_users` | `LiveCollabStatus` |
 | Advisory field locks with tie-breaking | Presence | `@collab_locks`, `collab_attrs/4`, `<.field_indicator>`, `validate_not_locked/5` | `LiveCollabField` |
 | Row and element activity (viewing / selected / editing) | Presence | `@collab_activities`, `collab_row_attrs/4`, `<.row_indicator>`, `<.element_activity>` | `LiveCollabElement` |
 | Live cursors | PubSub | `<.cursor_layer>` | `LiveCollabCursor` |
@@ -118,6 +119,19 @@ and handles every `live_collab:*` event for you. Your own `handle_event/3` and
 
 ## Usage
 
+### Away / idle status
+
+```heex
+<.status_reporter idle_after={60_000} />
+<.avatar_stack users={@collab_users} />
+```
+
+A tab is `:away` while its page is hidden or after `idle_after` ms without
+pointer, keyboard or scroll activity, and `:active` again on the next
+interaction. Each user in `@collab_users` has `status: :active | :away`, and a
+user counts as away only if all of their tabs are. `<.avatar_stack>` dims away
+users (CSS class `live-collab-away`).
+
 ### Field locks and server-side enforcement
 
 `collab_attrs/4` attaches the `LiveCollabField` hook and marks the input
@@ -172,7 +186,7 @@ removed immediately.
 ### Presenter mode and scroll following
 
 ```heex
-<.viewport_container container_id="doc" presenter={@presenting?} class="h-screen overflow-y-auto">
+<.viewport_container container_id="doc" presenter={@collab_spotlight_leader == @collab_client_id} auto_follow class="h-screen overflow-y-auto">
   ...
 </.viewport_container>
 
@@ -184,10 +198,10 @@ removed immediately.
 />
 ```
 
-A presenter's client pushes `live_collab:spotlight_lead` and
-`live_collab:spotlight_stop`. Followers' manual scrolling breaks follow mode.
-Add `data-collab-auto-follow="true"` to the container to follow presenters
-automatically. Presenting is allowed by default and denied for users with
+Start and stop presenting with `<button phx-click="live_collab:spotlight_lead">`
+and `phx-click="live_collab:spotlight_stop"`; LiveCollab handles and authorizes
+both. With `auto_follow`, everyone else follows the presenter's scrolling, and
+scrolling manually breaks out of follow mode. Presenting is allowed by default and denied for users with
 `role: "viewer"` / `"observer"`, `can_present?: false`, or when you assign
 `collab_can_present?: false`. Only the current presenter, or a user who may
 present, can stop a presentation.
@@ -200,6 +214,12 @@ presenter's next status change (see [Limitations](#limitations)).
 ```heex
 <.selection_layer container_id="board" class="relative h-[500px]">...</.selection_layer>
 ```
+
+`<.cursor_layer>` and `<.selection_layer>` render the overlay their hook draws
+into, marked `phx-update="ignore"` so LiveView re-renders don't remove it. If you
+attach a hook to your own element with `collab_cursor_attrs/2` or
+`collab_selection_attrs/2`, add `<LiveCollab.Components.overlay id="..." />`
+inside it.
 
 Report the local selection from your own code (normalized coordinates):
 

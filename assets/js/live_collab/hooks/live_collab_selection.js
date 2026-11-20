@@ -21,7 +21,16 @@
  * Security: names are written with textContent and colors must be #rrggbb.
  */
 
-import { departedClientIds, finite, matchesContainer, safeColor, safeName, safePush } from "../utils.js";
+import {
+  adoptLayer,
+  departedClientIds,
+  ensureLayerAttached,
+  finite,
+  matchesContainer,
+  safeColor,
+  safeName,
+  safePush
+} from "../utils.js";
 
 export const LiveCollabSelection = {
   mounted() {
@@ -38,11 +47,9 @@ export const LiveCollabSelection = {
       this.el.style.position = "relative";
     }
 
-    this.selectionLayer = document.createElement("div");
-    this.selectionLayer.className =
-      "live-collab-selection-layer pointer-events-none absolute inset-0 overflow-hidden z-40 select-none";
-    this.selectionLayer.setAttribute("aria-hidden", "true");
-    this.el.appendChild(this.selectionLayer);
+    const { layer, owned } = adoptLayer(this.el, "live-collab-selection-layer z-40");
+    this.selectionLayer = layer;
+    this.ownsLayer = owned;
 
     this.handleLocalSelection = this.handleLocalSelection.bind(this);
     this.handleLocalClear = this.handleLocalClear.bind(this);
@@ -62,12 +69,16 @@ export const LiveCollabSelection = {
     });
   },
 
+  updated() {
+    if (this.ownsLayer) ensureLayerAttached(this.el, this.selectionLayer);
+  },
+
   destroyed() {
     clearTimeout(this.trailingTimer);
     this.el.removeEventListener("live_collab:local_selection", this.handleLocalSelection);
     this.el.removeEventListener("live_collab:local_selection_clear", this.handleLocalClear);
     this.remoteSelections.forEach((_item, clientId) => this.removeRemoteSelection(clientId));
-    if (this.selectionLayer) this.selectionLayer.remove();
+    if (this.ownsLayer && this.selectionLayer) this.selectionLayer.remove();
   },
 
   // --- local selection -> server ------------------------------------------------
@@ -133,11 +144,18 @@ export const LiveCollabSelection = {
       el.style.border = `2px solid ${color}`;
       el.style.backgroundColor = `${color}1A`;
       el.style.borderRadius = "4px";
+      el.style.position = "absolute";
+      el.style.top = "0";
+      el.style.left = "0";
 
       const tag = document.createElement("div");
       tag.className =
         "live-collab-selection-tag absolute -top-5 left-0 px-1.5 py-0.5 rounded text-[10px] font-bold text-white whitespace-nowrap shadow-sm";
       tag.style.backgroundColor = color;
+      tag.style.color = "#fff";
+      tag.style.position = "absolute";
+      tag.style.top = "-20px";
+      tag.style.left = "0";
       tag.textContent = `${safeName(payload.user_name)}'s selection`;
 
       el.appendChild(tag);

@@ -63,6 +63,11 @@ defmodule LiveCollab.Telemetry do
     * `[:live_collab, :spotlight, :unauthorized]` - extra metadata `:action`
       (`:lead` or `:stop`).
 
+  ## Status
+
+    * `[:live_collab, :status, :changed]` - a tab became `:active` or `:away`;
+      extra metadata `:status`.
+
   ## Metrics example
 
   With `telemetry_metrics` (included in generated Phoenix apps), add to your
@@ -100,7 +105,8 @@ defmodule LiveCollab.Telemetry do
     [:event, :rejected],
     [:spotlight, :started],
     [:spotlight, :stopped],
-    [:spotlight, :unauthorized]
+    [:spotlight, :unauthorized],
+    [:status, :changed]
   ]
 
   @logger_handler_id "live-collab-default-logger"
@@ -173,6 +179,10 @@ defmodule LiveCollab.Telemetry do
   defp log_message([:lock, action], _m, meta) when action in [:claimed, :released, :denied] do
     {:debug,
      "[LiveCollab] lock #{action} on #{inspect(meta.field)} by #{meta.client_id} on #{meta.topic}"}
+  end
+
+  defp log_message([:status, :changed], _m, meta) do
+    {:debug, "[LiveCollab] #{meta.client_id} is #{meta.status} on #{meta.topic}"}
   end
 
   defp log_message([:session, action], _m, meta) do

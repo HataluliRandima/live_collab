@@ -44,8 +44,12 @@ defmodule LiveCollab.Presence do
           tabs_count: non_neg_integer(),
           active_fields: [String.t()],
           active_elements: [String.t()],
+          status: status(),
           metas: [map()]
         }
+
+  @typedoc "Activity status of a tab (`:away` when hidden or idle)."
+  @type status :: :active | :away
 
   @doc """
   Tracks a LiveView socket or process in the collaborative presence topic.
@@ -72,7 +76,8 @@ defmodule LiveCollab.Presence do
         acquired_at: 0,
         element: nil,
         element_type: :viewing,
-        element_acquired_at: 0
+        element_acquired_at: 0,
+        status: :active
       }
       |> Map.merge(extra_meta)
 
@@ -275,10 +280,30 @@ defmodule LiveCollab.Presence do
   end
 
   @doc """
+  Sets this tab's activity status (`:active` or `:away`) in Presence.
+
+  Must be called from the LiveView process that tracked the presence.
+  """
+  @spec update_status(
+          presence_module :: module(),
+          pid_or_socket :: pid() | Phoenix.LiveView.Socket.t(),
+          topic :: String.t(),
+          user_id :: term(),
+          status :: status()
+        ) :: {:ok, binary()} | {:error, term()}
+  def update_status(presence_module, pid_or_socket, topic, user_id, status)
+      when status in [:active, :away] do
+    presence_module.update(to_pid(pid_or_socket), topic, to_string(user_id), fn meta ->
+      Map.put(meta, :status, status)
+    end)
+  end
+
+  @doc """
   Transforms raw `c:Phoenix.Presence.list/1` output into a list of structured `user_collab` maps.
 
   Consolidates multiple tabs for the same user while preserving tabs count, active fields,
-  and active element locations.
+  and active element locations. A user is `:away` only when every one of their
+  tabs is away; metas without a status (e.g. from older nodes) count as active.
   """
   @spec extract_users(map()) :: [user_collab()]
   def extract_users(presence_entries) when is_map(presence_entries) do
@@ -311,10 +336,15 @@ defmodule LiveCollab.Presence do
         tabs_count: length(metas),
         active_fields: active_fields,
         active_elements: active_elements,
+        status: user_status(metas),
         metas: metas
       }
     end
     |> Enum.sort_by(& &1.name)
+  end
+
+  defp user_status(metas) do
+    if Enum.all?(metas, &(Map.get(&1, :status) == :away)), do: :away, else: :active
   end
 
   @doc """

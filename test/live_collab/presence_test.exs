@@ -128,4 +128,17 @@ defmodule LiveCollab.PresenceTest do
       assert pid == self()
     end
   end
+
+  describe "extract_users/1 status" do
+    test "a user is away only when every tab is away; missing status counts as active" do
+      entries = %{
+        "a" => %{metas: [%{user_name: "A", status: :away}, %{user_name: "A", status: :away}]},
+        "b" => %{metas: [%{user_name: "B", status: :away}, %{user_name: "B", status: :active}]},
+        "c" => %{metas: [%{user_name: "C"}]}
+      }
+
+      statuses = Presence.extract_users(entries) |> Map.new(&{&1.id, &1.status})
+      assert statuses == %{"a" => :away, "b" => :active, "c" => :active}
+    end
+  end
 end

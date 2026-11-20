@@ -81,6 +81,7 @@ defmodule LiveCollab.Test.CollabLive do
       <LiveCollab.Components.cursor_layer container_id="canvas">c</LiveCollab.Components.cursor_layer>
       <LiveCollab.Components.viewport_container container_id="doc">v</LiveCollab.Components.viewport_container>
       <LiveCollab.Components.selection_layer container_id="board">s</LiveCollab.Components.selection_layer>
+      <LiveCollab.Components.status_reporter />
       <span id="users-count">{length(@collab_users)}</span>
       <span :for={{field, lock} <- @collab_locks} id={"lock-#{field}"}>{lock.user_name}</span>
     </div>

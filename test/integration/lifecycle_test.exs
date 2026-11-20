@@ -259,7 +259,7 @@ defmodule LiveCollab.Integration.LifecycleTest do
       ids = LazyHTML.attribute(hooks, "id")
 
       assert Enum.sort(hook_names) ==
-               ~w(LiveCollabCursor LiveCollabElement LiveCollabField LiveCollabSelection LiveCollabViewport)
+               ~w(LiveCollabCursor LiveCollabElement LiveCollabField LiveCollabSelection LiveCollabStatus LiveCollabViewport)
 
       # attribute/2 skips elements without the attribute, so compare counts.
       assert length(ids) == length(hook_names)
