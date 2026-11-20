@@ -200,4 +200,36 @@ defmodule LiveCollab.ComponentsTest do
       assert style =~ ~r/\A--collab-element-color: #[0-9A-F]{6};\z/
     end
   end
+
+  describe "hook ids (LiveView requires a DOM id on phx-hook elements)" do
+    test "every helper emits a deterministic, selector-safe id" do
+      assert Keyword.get(Components.collab_attrs("order.name", %{}, "me"), :id) ==
+               "live-collab-field-order_2ename"
+
+      assert Keyword.get(Components.collab_row_attrs("row:42", %{}, "me"), :id) ==
+               "live-collab-element-row_3a42"
+
+      assert Keyword.get(Components.collab_cursor_attrs("canvas"), :id) ==
+               "live-collab-cursor-canvas"
+
+      assert Keyword.get(Components.collab_viewport_attrs("doc"), :id) ==
+               "live-collab-viewport-doc"
+
+      assert Keyword.get(Components.collab_selection_attrs("b"), :id) == "live-collab-selection-b"
+    end
+
+    test "distinct identifiers never collide" do
+      ids =
+        for f <- ["a.b", "a:b", "a_b", "a-b", "a b"],
+            do: Keyword.get(Components.collab_attrs(f, %{}, nil), :id)
+
+      assert length(Enum.uniq(ids)) == 5
+      assert Enum.all?(ids, &Regex.match?(~r/\A[A-Za-z0-9_-]+\z/, &1))
+    end
+
+    test "id can be overridden or omitted" do
+      assert Keyword.get(Components.collab_attrs("f", %{}, nil, id: "mine"), :id) == "mine"
+      refute Keyword.has_key?(Components.collab_attrs("f", %{}, nil, id: false), :id)
+    end
+  end
 end

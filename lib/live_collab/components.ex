@@ -382,13 +382,18 @@ defmodule LiveCollab.Components do
     doc: "Normalized distance threshold to avoid jitter broadcasts"
 
   attr :class, :string, default: nil, doc: "CSS classes on the outer container"
+
+  attr :id, :string,
+    default: nil,
+    doc: "DOM id (LiveView hooks require one); derived from container_id by default"
+
   slot :inner_block, required: false
 
   def cursor_layer(assigns) do
     ~H"""
     <div
       class={["live-collab-cursor-container relative", @class]}
-      {collab_cursor_attrs(@container_id, throttle: @throttle, deadband: @deadband)}
+      {collab_cursor_attrs(@container_id, throttle: @throttle, deadband: @deadband, id: @id)}
     >
       <%= render_slot(@inner_block) %>
     </div>
@@ -413,6 +418,11 @@ defmodule LiveCollab.Components do
   attr :following, :string, default: nil, doc: "Client ID of presenter to follow"
   attr :throttle, :integer, default: 40, doc: "Scroll broadcast throttle in milliseconds"
   attr :class, :string, default: nil
+
+  attr :id, :string,
+    default: nil,
+    doc: "DOM id (LiveView hooks require one); derived from container_id by default"
+
   slot :inner_block, required: false
 
   def viewport_container(assigns) do
@@ -422,7 +432,8 @@ defmodule LiveCollab.Components do
       {collab_viewport_attrs(@container_id,
         presenter: @presenter,
         following: @following,
-        throttle: @throttle
+        throttle: @throttle,
+        id: @id
       )}
     >
       <%= render_slot(@inner_block) %>
@@ -492,13 +503,18 @@ defmodule LiveCollab.Components do
   """
   attr :container_id, :string, default: "default"
   attr :class, :string, default: nil
+
+  attr :id, :string,
+    default: nil,
+    doc: "DOM id (LiveView hooks require one); derived from container_id by default"
+
   slot :inner_block, required: false
 
   def selection_layer(assigns) do
     ~H"""
     <div
       class={["live-collab-selection-container relative", @class]}
-      {collab_selection_attrs(@container_id)}
+      {collab_selection_attrs(@container_id, id: @id)}
     >
       <%= render_slot(@inner_block) %>
     </div>
@@ -513,18 +529,22 @@ defmodule LiveCollab.Components do
 
   - `throttle` - Milliseconds between client cursor broadcasts (default `30`).
   - `deadband` - Minimum normalized coordinate delta to broadcast (default `0.0015`).
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_cursor_attrs(container_id :: String.t(), opts :: keyword()) :: list()
   def collab_cursor_attrs(container_id \\ "default", opts \\ []) do
     throttle = Keyword.get(opts, :throttle, 30)
     deadband = Keyword.get(opts, :deadband, 0.0015)
 
-    [
-      "phx-hook": "LiveCollabCursor",
-      "data-collab-container": container_id,
-      "data-collab-throttle": to_string(throttle),
-      "data-collab-deadband": to_string(deadband)
-    ]
+    hook_id("live-collab-cursor", container_id, opts) ++
+      [
+        "phx-hook": "LiveCollabCursor",
+        "data-collab-container": container_id,
+        "data-collab-throttle": to_string(throttle),
+        "data-collab-deadband": to_string(deadband)
+      ]
   end
 
   @doc """
@@ -536,6 +556,9 @@ defmodule LiveCollab.Components do
   - `presenter` - Boolean indicating if this client broadcasts scroll coordinates (default `false`).
   - `following` - Client ID string of presenter currently being followed.
   - `throttle` - Milliseconds between scroll broadcasts (default `40`).
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_viewport_attrs(container_id :: String.t(), opts :: keyword()) :: list()
   def collab_viewport_attrs(container_id \\ "default", opts \\ []) do
@@ -543,12 +566,14 @@ defmodule LiveCollab.Components do
     following = Keyword.get(opts, :following)
     throttle = Keyword.get(opts, :throttle, 40)
 
-    attrs = [
-      "phx-hook": "LiveCollabViewport",
-      "data-collab-container": container_id,
-      "data-collab-presenter": to_string(presenter),
-      "data-collab-throttle": to_string(throttle)
-    ]
+    attrs =
+      hook_id("live-collab-viewport", container_id, opts) ++
+        [
+          "phx-hook": "LiveCollabViewport",
+          "data-collab-container": container_id,
+          "data-collab-presenter": to_string(presenter),
+          "data-collab-throttle": to_string(throttle)
+        ]
 
     attrs =
       if following do
@@ -562,13 +587,17 @@ defmodule LiveCollab.Components do
 
   @doc """
   Generates HTML tag attributes to attach the `LiveCollabSelection` hook to a canvas or container.
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_selection_attrs(container_id :: String.t(), opts :: keyword()) :: list()
-  def collab_selection_attrs(container_id \\ "default", _opts \\ []) do
-    [
-      "phx-hook": "LiveCollabSelection",
-      "data-collab-container": container_id
-    ]
+  def collab_selection_attrs(container_id \\ "default", opts \\ []) do
+    hook_id("live-collab-selection", container_id, opts) ++
+      [
+        "phx-hook": "LiveCollabSelection",
+        "data-collab-container": container_id
+      ]
   end
 
   @doc """
@@ -582,6 +611,9 @@ defmodule LiveCollab.Components do
         name="customer[name]"
         {collab_attrs("customer.name", @collab_locks, @collab_client_id)}
       />
+  Options: `readonly: false` to keep the input editable while locked;
+  `id:` as for the other helpers (LiveView hooks require a DOM id, so one is
+  generated from the field name unless you pass `id: "..."` or `id: false`).
   """
   @spec collab_attrs(
           field :: String.t(),
@@ -595,12 +627,14 @@ defmodule LiveCollab.Components do
     holder = Field.current_holder(locks, field)
     holder_client = if holder, do: holder.client_id, else: nil
 
-    attrs = [
-      "phx-hook": "LiveCollabField",
-      "data-collab-field": field,
-      "data-collab-locked": to_string(locked_by_other),
-      "data-collab-locked-by-client": holder_client || ""
-    ]
+    attrs =
+      hook_id("live-collab-field", field, opts) ++
+        [
+          "phx-hook": "LiveCollabField",
+          "data-collab-field": field,
+          "data-collab-locked": to_string(locked_by_other),
+          "data-collab-locked-by-client": holder_client || ""
+        ]
 
     attrs =
       if readonly_on_lock and locked_by_other do
@@ -620,6 +654,9 @@ defmodule LiveCollab.Components do
 
   - `hover_intent` - Debounce in milliseconds for hover intent (e.g. `300`). Omit or `nil` for click/focus only.
   - `type` - Activity type when triggered (`:viewing` or `:selected`). Default `:viewing`.
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_row_attrs(
           element_id :: String.t(),
@@ -635,12 +672,14 @@ defmodule LiveCollab.Components do
     hover_intent = Keyword.get(opts, :hover_intent)
     activity_type = Keyword.get(opts, :type, :viewing)
 
-    attrs = [
-      "phx-hook": "LiveCollabElement",
-      "data-collab-element": element_id,
-      "data-collab-type": to_string(activity_type),
-      "data-collab-active": to_string(active_by_other)
-    ]
+    attrs =
+      hook_id("live-collab-element", element_id, opts) ++
+        [
+          "phx-hook": "LiveCollabElement",
+          "data-collab-element": element_id,
+          "data-collab-type": to_string(activity_type),
+          "data-collab-active": to_string(active_by_other)
+        ]
 
     attrs =
       if hover_intent && hover_intent > 0 do
@@ -682,6 +721,28 @@ defmodule LiveCollab.Components do
 
   defp collaborator_summary([first | rest]) do
     "#{first.user_name} and #{length(rest)} others are viewing"
+  end
+
+  # LiveView only mounts a phx-hook element that has a DOM id ("no DOM ID for
+  # hook" otherwise), so every helper emits one. The default is derived from the
+  # field/element/container id with every character outside [A-Za-z0-9_-]
+  # hex-escaped, which keeps it unique and safe in CSS selectors.
+  # `id: "custom"` overrides it; `id: false` omits it when the element already
+  # carries its own id.
+  defp hook_id(prefix, raw, opts) do
+    case Keyword.get(opts, :id) do
+      false -> []
+      nil -> [id: prefix <> "-" <> dom_safe(to_string(raw))]
+      id -> [id: to_string(id)]
+    end
+  end
+
+  defp dom_safe(value) do
+    for <<byte <- value>>, into: "" do
+      if byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or byte in [?-],
+        do: <<byte>>,
+        else: "_" <> Base.encode16(<<byte>>, case: :lower)
+    end
   end
 
   # Colors end up inside `style` attributes. HEEx escapes HTML, not CSS, so only

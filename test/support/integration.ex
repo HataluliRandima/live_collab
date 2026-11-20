@@ -71,6 +71,16 @@ defmodule LiveCollab.Test.CollabLive do
 
     ~H"""
     <div id="collab">
+      <%!-- Every LiveCollab hook helper, so tests can check the rendered markup. --%>
+      <input type="text" name="title" {LiveCollab.Components.collab_attrs("doc.title", @collab_locks, @collab_client_id)} />
+      <table>
+        <tr {LiveCollab.Components.collab_row_attrs("row:1", @collab_activities, @collab_client_id)}>
+          <td>row</td>
+        </tr>
+      </table>
+      <LiveCollab.Components.cursor_layer container_id="canvas">c</LiveCollab.Components.cursor_layer>
+      <LiveCollab.Components.viewport_container container_id="doc">v</LiveCollab.Components.viewport_container>
+      <LiveCollab.Components.selection_layer container_id="board">s</LiveCollab.Components.selection_layer>
       <span id="users-count">{length(@collab_users)}</span>
       <span :for={{field, lock} <- @collab_locks} id={"lock-#{field}"}>{lock.user_name}</span>
     </div>

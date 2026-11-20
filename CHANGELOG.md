@@ -34,6 +34,9 @@ recommended. See `guides/guarantees.md` for what LiveCollab does and does not gu
   `lock_lost` handling; departed cursors and selections never removed; a perpetual
   `requestAnimationFrame` loop; listener leaks; `pushEvent` throwing after disconnect.
 - `import "live_collab"` could not resolve (`package.json` was not at the package root).
+- No hook could mount in a real browser: LiveView requires a DOM `id` on every
+  `phx-hook` element, and none of the helpers or components rendered one. They
+  now emit a deterministic id (override with `id: "..."`, omit with `id: false`).
 
 ### Changed
 - High-frequency events no longer re-render the sender: rate-limiter state moved

@@ -242,6 +242,32 @@ defmodule LiveCollab.Integration.LifecycleTest do
     end
   end
 
+  describe "rendered markup" do
+    test "regression: every LiveCollab hook element has a unique DOM id" do
+      # LiveView silently refuses to mount a phx-hook element without an id
+      # ("no DOM ID for hook"). Previously no helper emitted one, so in a real
+      # browser no LiveCollab hook ever mounted.
+      view = join(unique_doc(), @alice)
+
+      hooks =
+        view
+        |> render()
+        |> LazyHTML.from_fragment()
+        |> LazyHTML.query("[phx-hook]")
+
+      hook_names = LazyHTML.attribute(hooks, "phx-hook")
+      ids = LazyHTML.attribute(hooks, "id")
+
+      assert Enum.sort(hook_names) ==
+               ~w(LiveCollabCursor LiveCollabElement LiveCollabField LiveCollabSelection LiveCollabViewport)
+
+      # attribute/2 skips elements without the attribute, so compare counts.
+      assert length(ids) == length(hook_names)
+      assert Enum.all?(ids, &(is_binary(&1) and &1 != ""))
+      assert length(Enum.uniq(ids)) == length(ids)
+    end
+  end
+
   describe "coexistence with application callbacks" do
     test "application events and messages pass through LiveCollab's hooks" do
       doc = unique_doc()
