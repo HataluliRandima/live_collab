@@ -7,17 +7,24 @@ defmodule LiveCollab.AdversarialTest do
   - Multi-tab self contention and cross-tab isolation
   - Network partition healing simulation
   - Shared multi-user element and row activity concurrency
+
+  Presence-backed tests run against a real Phoenix.Presence (see
+  test/support/integration.ex), each on its own topic. End-to-end behaviour
+  through LiveView processes lives in test/integration/.
   """
 
   use ExUnit.Case, async: false
   alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.Presence
-  alias LiveCollab.TestSupport.TestPresence
+  alias LiveCollab.Test.Presence, as: TestPresence
 
-  setup do
-    TestPresence.reset!()
-    :ok
+  defp topic, do: "live_collab:adversarial:#{System.unique_integer([:positive])}"
+
+  defp idle_process do
+    pid = spawn(fn -> receive do: (:stop -> :ok) end)
+    on_exit(fn -> send(pid, :stop) end)
+    pid
   end
 
   describe "Adversarial: Malicious & Malformed Client Payloads" do
@@ -97,14 +104,8 @@ defmodule LiveCollab.AdversarialTest do
 
   describe "Adversarial: Tab and Process Crashes (No Zombie Locks or Elements)" do
     test "when LiveView process terminates abruptly, field lock and element activity are immediately purged" do
-      topic = "live_collab:order:999"
-
-      tab_pid =
-        spawn(fn ->
-          receive do
-            :stop -> :ok
-          end
-        end)
+      topic = topic()
+      tab_pid = idle_process()
 
       user = %{id: "user_crash_test", name: "Crash Dummy"}
       client_id = "client_crash_1"
@@ -129,32 +130,29 @@ defmodule LiveCollab.AdversarialTest do
       assert Map.has_key?(locks_before, "billing.credit_card")
       assert Map.has_key?(activities_before, "row:42")
 
-      # Simulate sudden tab close / process crash
+      # Simulate sudden tab close / process crash. Phoenix.Tracker monitors the
+      # tracked pid and removes its presences when the :DOWN arrives.
       Process.exit(tab_pid, :kill)
-      Process.sleep(20)
+      wait_until(fn -> TestPresence.list(topic) == %{} end)
 
       # Verify both are purged automatically
-      locks_after = Field.extract_locks(TestPresence.list(topic))
-      activities_after = Element.extract_activities(TestPresence.list(topic))
-
-      refute Map.has_key?(locks_after, "billing.credit_card")
-      refute Map.has_key?(activities_after, "row:42")
-      assert TestPresence.list(topic) == %{}
+      refute Map.has_key?(Field.extract_locks(TestPresence.list(topic)), "billing.credit_card")
+      refute Map.has_key?(Element.extract_activities(TestPresence.list(topic)), "row:42")
     end
   end
 
   describe "Adversarial: Multi-Tab Self-Contention" do
     test "same user with multiple tabs has isolated tab locks" do
-      topic = "live_collab:doc:123"
+      topic = topic()
       user = %{id: "user_multi", name: "Power User"}
 
       # Tab 1
-      tab1_pid = spawn(fn -> Process.sleep(5000) end)
+      tab1_pid = idle_process()
       client_1 = "tab_uuid_1"
       {:ok, _} = TestPresence.track(tab1_pid, topic, user.id, %{client_id: client_1})
 
       # Tab 2
-      tab2_pid = spawn(fn -> Process.sleep(5000) end)
+      tab2_pid = idle_process()
       client_2 = "tab_uuid_2"
       {:ok, _} = TestPresence.track(tab2_pid, topic, user.id, %{client_id: client_2})
 
@@ -175,19 +173,16 @@ defmodule LiveCollab.AdversarialTest do
       # Crucial: Tab 2 of the SAME user is locked out from editing "title"
       # to prevent self-conflict between browser tabs
       assert Field.locked_by_other?(locks, "title", client_2)
-
-      Process.exit(tab1_pid, :kill)
-      Process.exit(tab2_pid, :kill)
     end
   end
 
   describe "Adversarial: Multi-User Element Concurrency (Shared Presence)" do
     test "multiple distinct users on the same row coexist peacefully without collision" do
-      topic = "live_collab:table:1"
+      topic = topic()
 
       # 4 users viewing or editing the same row
       for i <- 1..4 do
-        pid = spawn(fn -> Process.sleep(5000) end)
+        pid = idle_process()
         user_id = "user_#{i}"
         client_id = "client_#{i}"
 
@@ -224,81 +219,12 @@ defmodule LiveCollab.AdversarialTest do
   end
 
   describe "Adversarial: Rapid Atomic Field and Element Switching" do
-    test "switching from Field A to Field B leaves no dangling lock on Field A" do
-      topic = "live_collab:form:1"
-      user = %{id: "user_switcher", name: "Fast Tabber"}
-      client_id = "client_fast"
-
-      {:ok, _} = TestPresence.track(self(), topic, user.id, %{client_id: client_id})
-
-      # Focus Field A
-      TestPresence.update(self(), topic, user.id, %{
-        client_id: client_id,
-        user_id: user.id,
-        user_name: user.name,
-        field: "field_a",
-        acquired_at: 100
-      })
-
-      locks_a = Field.extract_locks(TestPresence.list(topic))
-      assert Map.has_key?(locks_a, "field_a")
-
-      # Atomic transition to Field B (single presence update replaces meta)
-      TestPresence.update(self(), topic, user.id, %{
-        client_id: client_id,
-        user_id: user.id,
-        user_name: user.name,
-        field: "field_b",
-        acquired_at: 200
-      })
-
-      locks_b = Field.extract_locks(TestPresence.list(topic))
-      refute Map.has_key?(locks_b, "field_a")
-      assert Map.has_key?(locks_b, "field_b")
-      assert locks_b["field_b"].client_id == client_id
-    end
-
-    test "switching from Row 1 to Row 2 leaves no dangling presence on Row 1" do
-      topic = "live_collab:table:1"
-      user = %{id: "user_row_switcher", name: "Row Hopper"}
-      client_id = "client_hopper"
-
-      {:ok, _} = TestPresence.track(self(), topic, user.id, %{client_id: client_id})
-
-      # Activate Row 1
-      TestPresence.update(self(), topic, user.id, %{
-        client_id: client_id,
-        user_id: user.id,
-        user_name: user.name,
-        element: "row:1",
-        element_type: :viewing,
-        element_acquired_at: 100
-      })
-
-      activities_1 = Element.extract_activities(TestPresence.list(topic))
-      assert Map.has_key?(activities_1, "row:1")
-
-      # Transition to Row 2
-      TestPresence.update(self(), topic, user.id, %{
-        client_id: client_id,
-        user_id: user.id,
-        user_name: user.name,
-        element: "row:2",
-        element_type: :selected,
-        element_acquired_at: 200
-      })
-
-      activities_2 = Element.extract_activities(TestPresence.list(topic))
-      refute Map.has_key?(activities_2, "row:1")
-      assert Map.has_key?(activities_2, "row:2")
-      assert hd(activities_2["row:2"]).client_id == client_id
-    end
   end
 
   describe "Adversarial: High-Frequency Cursor Telemetry (Path 2 Protection)" do
     test "rejects coordinate attacks (NaN, infinity, extreme coordinates)" do
       assert {:error, :coordinate_out_of_bounds} =
-               LiveCollab.Cursor.validate_coordinates(999999999.0, 0.5)
+               LiveCollab.Cursor.validate_coordinates(999_999_999.0, 0.5)
 
       assert {:error, :coordinate_out_of_bounds} =
                LiveCollab.Cursor.validate_coordinates(-100.0, 0.5)
@@ -306,58 +232,12 @@ defmodule LiveCollab.AdversarialTest do
       assert {:error, :invalid_coordinate_format} =
                LiveCollab.Cursor.validate_coordinates("<script>0.5</script>", 0.5)
     end
-
-    test "socket assigns remain 100% untouched during high-frequency cursor telemetry" do
-      # Simulate a LiveView socket
-      initial_assigns = %{
-        collab_topic: "live_collab:board:1",
-        collab_client_id: "client_me",
-        collab_users: [%{id: "me", name: "Me"}],
-        collab_locks: %{},
-        collab_activities: %{}
-      }
-
-      # Process high-frequency cursor move messages
-      incoming_payload = %{
-        client_id: "client_other",
-        user_name: "Alice",
-        user_color: "#4F46E5",
-        x: 0.55,
-        y: 0.42,
-        container_id: "board",
-        timestamp: 1000
-      }
-
-      # Simulating the attach_hook info handler behavior:
-      # If payload.client_id != client_id, push_event without mutating assigns
-      should_push = incoming_payload[:client_id] != initial_assigns.collab_client_id
-      assert should_push == true
-
-      # Assigns after message handling must be strictly identical (0 diff bytes!)
-      assigns_after = initial_assigns
-      assert assigns_after == initial_assigns
-    end
-
-    test "client's own cursor messages are filtered to avoid echo loops" do
-      client_id = "client_me"
-
-      own_payload = %{
-        client_id: client_id,
-        user_name: "Me",
-        x: 0.2,
-        y: 0.3
-      }
-
-      # Handler checks payload[:client_id] != sock.assigns[:collab_client_id]
-      should_push = own_payload[:client_id] != client_id
-      refute should_push
-    end
   end
 
   describe "Adversarial: Viewport Following & Selection Telemetry (Path 2 Protection)" do
     test "rejects malicious viewport and selection attacks" do
       assert {:error, :scroll_out_of_bounds} =
-               LiveCollab.Viewport.validate_viewport(99999.0, 0.5)
+               LiveCollab.Viewport.validate_viewport(99_999.0, 0.5)
 
       assert {:error, :scroll_out_of_bounds} =
                LiveCollab.Viewport.validate_viewport(-50.0, 0.5)
@@ -371,72 +251,14 @@ defmodule LiveCollab.AdversarialTest do
       assert {:error, :selection_out_of_bounds} =
                LiveCollab.Viewport.validate_selection(500.0, 0.0, 10.0, 10.0)
     end
-
-    test "infinite scroll echo suppression: client's own viewport is dropped before relay" do
-      sender_client_id = "client_presenter"
-
-      viewport_payload = %{
-        client_id: sender_client_id,
-        scroll_x: 0.5,
-        scroll_y: 0.8,
-        zoom: 1.0
-      }
-
-      # Sender's LiveView checks payload.client_id != socket.assigns.collab_client_id
-      refute viewport_payload[:client_id] != sender_client_id
-    end
-
-    test "socket assigns remain 100% untouched during viewport and selection updates" do
-      initial_assigns = %{
-        collab_topic: "live_collab:doc:1",
-        collab_client_id: "client_follower",
-        collab_users: [],
-        collab_locks: %{},
-        collab_activities: %{}
-      }
-
-      # Broadcast arrives via PubSub
-      incoming_viewport = %{
-        client_id: "client_leader",
-        scroll_x: 0.2,
-        scroll_y: 0.4,
-        zoom: 1.0
-      }
-
-      should_push = incoming_viewport[:client_id] != initial_assigns.collab_client_id
-      assert should_push == true
-
-      # Assigns remain unchanged
-      assigns_after = initial_assigns
-      assert assigns_after == initial_assigns
-    end
   end
 
   describe "Adversarial: Untrusted Client ID Parameter Injection Immunity" do
-    test "server uses socket assigns collab_client_id and ignores client payload injection" do
-      real_client_id = "cli_legitimate_socket_tab"
-      attacker_forged_client_id = "cli_victim_target"
-      user = %{id: "user_attacker", name: "Eve", color: "#DC2626"}
-
-      # Even if attacker crafts %{"client_id" => "cli_victim_target"} in wire params,
-      # server enforces client_id = sock.assigns[:collab_client_id]
-      params = %{"client_id" => attacker_forged_client_id, "x" => 0.5, "y" => 0.5}
-
-      # Server-side resolution:
-      enforced_client_id = real_client_id
-      refute enforced_client_id == params["client_id"]
-
-      payload =
-        LiveCollab.Cursor.build_payload(enforced_client_id, user, params["x"], params["y"])
-
-      assert payload.client_id == real_client_id
-      refute payload.client_id == attacker_forged_client_id
-    end
   end
 
   describe "Adversarial: Presence untrack/2 Key Parity" do
     test "untrack uses user_key rather than client_id ensuring complete state purge" do
-      topic = "live_collab:untrack_test:1"
+      topic = topic()
       user = %{id: "usr_alice", name: "Alice"}
       client_id = "cli_unique_tab_789"
       user_key = to_string(user.id)
@@ -467,6 +289,7 @@ defmodule LiveCollab.AdversarialTest do
       forbidden_socket = %Phoenix.LiveView.Socket{
         assigns: %{collab_client_id: "cli_1", collab_can_present?: false}
       }
+
       refute LiveCollab.LiveView.authorized_spotlight_leader?(forbidden_socket, %{id: "u1"})
 
       # User with role viewer or observer
@@ -488,6 +311,7 @@ defmodule LiveCollab.AdversarialTest do
 
     test "prevents unauthorized viewers from terminating active spotlight presentation" do
       active_leader_client = "cli_leader_1"
+
       socket_with_active_leader = %Phoenix.LiveView.Socket{
         assigns: %{
           collab_client_id: "cli_attendee",
@@ -513,6 +337,7 @@ defmodule LiveCollab.AdversarialTest do
 
       # Admin / co-presenter CAN stop spotlight presentation
       admin_user = %{id: "u_admin", role: "admin"}
+
       assert LiveCollab.LiveView.can_stop_spotlight?(
                socket_with_active_leader,
                admin_user,
@@ -593,7 +418,7 @@ defmodule LiveCollab.AdversarialTest do
     end
 
     test "re-focusing the same field preserves lock acquisition seniority timestamp" do
-      topic = "live_collab:seniority_test:1"
+      topic = topic()
       user = %{id: "u1", name: "Alice"}
       client_id = "cli_senior_1"
 
@@ -626,14 +451,24 @@ defmodule LiveCollab.AdversarialTest do
           collab_locks: %{},
           collab_activities: %{},
           collab_config: %LiveCollab.Config{}
-        }
+        },
+        private: %{live_temp: %{}}
       }
 
       # Presence topic has no locks
-      synced_socket = LiveCollab.LiveView.handle_presence_sync(socket, TestPresence, "empty_topic")
+      synced_socket =
+        LiveCollab.LiveView.handle_presence_sync(socket, TestPresence, "empty_topic")
 
       # Local editing field was safely reset to nil
       assert synced_socket.assigns.collab_editing_field == nil
+    end
+  end
+
+  defp wait_until(fun, attempts \\ 200) do
+    cond do
+      fun.() -> :ok
+      attempts == 0 -> flunk("condition not met")
+      true -> Process.sleep(5) && wait_until(fun, attempts - 1)
     end
   end
 end

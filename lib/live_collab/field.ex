@@ -3,23 +3,30 @@ defmodule LiveCollab.Field do
   Manages field-level locks, deterministic conflict resolution, sanitization,
   and server-side changeset validations.
 
-  ## Deterministic Conflict Resolution (Tie-Breaking)
+  ## Advisory locks and conflict resolution
 
-  Because `Phoenix.Presence` is eventually consistent (CRDT), concurrent focus events
-  from two users during network partition or identical millisecond windows will result
-  in both clients initially claiming the lock in their local presence metadata.
+  Field locks are **advisory**: they are claims stored in each collaborator's
+  `Phoenix.Presence` metadata, not a mutual-exclusion primitive. Presence is an
+  eventually consistent CRDT, so two clients (possibly on different nodes, or on
+  both sides of a network partition) can claim the same field concurrently.
 
-  `LiveCollab.Field` resolves this deterministically across all nodes without a central
-  lock coordinator by sorting claims on:
+  Every node resolves competing claims with the same pure function,
+  `resolve_conflict/2`, over the same converged Presence state, so **all nodes
+  agree on the winner once Presence has converged**. Clients that lose are sent
+  `live_collab:lock_lost`. Before convergence (e.g. during a partition) each side
+  may briefly believe it holds the lock — use `validate_not_locked/5` on submit,
+  and treat locks as a UX aid rather than a data-integrity guarantee.
 
-      `{acquired_at, client_id}`
-
-  1. The claim with the earliest `acquired_at` timestamp wins.
-  2. If timestamps are identical, the lexicographically lower `client_id` wins.
-
-  Because all nodes have identical inputs and identical deterministic comparison rules,
-  every node arrives at the identical winner simultaneously upon CRDT state merge.
+  Claim timestamps are taken from the wall clock of the node hosting each
+  LiveView. With clock skew larger than `clock_skew_tolerance_ms` between nodes,
+  "earliest claim wins" reflects the skewed clocks rather than real time; the
+  outcome is still deterministic and identical on every node.
   """
+
+  # Ecto is optional: LiveCollab compiles and runs without it.
+  @compile {:no_warn_undefined, Ecto.Changeset}
+
+  @field_id_regex ~r/\A[a-zA-Z0-9_\.\-:\[\]]+\z/
 
   @type client_id :: String.t()
   @type user_id :: String.t() | integer()
@@ -49,81 +56,58 @@ defmodule LiveCollab.Field do
   @spec validate_field_id(term(), pos_integer()) :: {:ok, String.t()} | {:error, atom()}
   def validate_field_id(field_id, max_length \\ 255)
 
-  def validate_field_id(field_id, max_length) when is_binary(field_id) do
-    cond do
-      byte_size(field_id) == 0 ->
-        {:error, :empty_field_id}
-
-      byte_size(field_id) > max_length ->
-        {:error, :field_id_too_long}
-
-      not String.valid?(field_id) ->
-        {:error, :invalid_encoding}
-
-      String.contains?(field_id, "..") ->
-        {:error, :disallowed_characters}
-
-      Regex.match?(~r/^[a-zA-Z0-9_\.\-:\[\]]+$/, field_id) ->
-        {:ok, field_id}
-
-      true ->
-        {:error, :disallowed_characters}
+  def validate_field_id(field_id, max_length) do
+    case LiveCollab.Validation.identifier(field_id, max_length, @field_id_regex) do
+      {:ok, id} -> {:ok, id}
+      {:error, :empty} -> {:error, :empty_field_id}
+      {:error, :too_long} -> {:error, :field_id_too_long}
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  def validate_field_id(_invalid, _max_length), do: {:error, :invalid_type}
-
   @doc """
-  Resolves a list of competing field claims into a deterministic winner.
+  Resolves competing claims on one field into a single, deterministic winner.
 
-  Uses `{time_bucket, client_id, user_id}` ordering:
-  - Bins timestamps into `clock_skew_tolerance_ms` windows (default 500ms).
-  - Claims acquired earlier outside the tolerance window win decisively.
-  - Claims acquired within the same tolerance window are treated as concurrent,
-    breaking ties deterministically by `client_id` (and `user_id` as secondary)
-    without vulnerability to inter-node clock skew.
-  - Future timestamp drift and invalid timestamps are safely bounded.
+  Claims are ordered by `{window, client_id, user_id}` where
+  `window = div(acquired_at, clock_skew_tolerance_ms)`:
+
+    * a claim in an earlier time window wins;
+    * claims in the same window are ordered by `client_id` (then `user_id`);
+    * claims with a missing or non-positive `acquired_at` sort last.
+
+  The function is pure — it depends only on its arguments, never on the local
+  clock — so every node computes the same winner from the same set of claims,
+  regardless of the order in which they arrived.
+
+  Windows are fixed-size buckets, so two claims a few milliseconds apart can
+  straddle a window boundary; in that case the earlier one wins on time. A
+  `clock_skew_tolerance_ms` of `0` orders strictly by timestamp.
   """
-  @spec resolve_conflict([lock_meta()], non_neg_integer()) :: lock_meta() | nil
+  @spec resolve_conflict([map()], non_neg_integer()) :: map() | nil
   def resolve_conflict(claims, clock_skew_tolerance_ms \\ 500)
   def resolve_conflict([], _tolerance), do: nil
   def resolve_conflict([single], _tolerance), do: single
 
-  def resolve_conflict(claims, clock_skew_tolerance_ms) when is_list(claims) do
-    now = System.system_time(:millisecond)
+  def resolve_conflict(claims, clock_skew_tolerance_ms)
+      when is_list(claims) and is_integer(clock_skew_tolerance_ms) and
+             clock_skew_tolerance_ms >= 0 do
+    Enum.min_by(claims, &claim_sort_key(&1, clock_skew_tolerance_ms))
+  end
 
-    Enum.min_by(claims, fn claim ->
-      acquired_at = Map.get(claim, :acquired_at, :infinity)
+  defp claim_sort_key(claim, tolerance) do
+    time_key =
+      case Map.get(claim, :acquired_at) do
+        at when is_integer(at) and at > 0 and tolerance > 0 -> div(at, tolerance)
+        at when is_integer(at) and at > 0 -> at
+        # Atoms sort after all integers in Erlang term order.
+        _invalid -> :infinity
+      end
 
-      sanitized_at =
-        cond do
-          not is_integer(acquired_at) or acquired_at <= 0 ->
-            :infinity
-
-          is_integer(acquired_at) and acquired_at > now + clock_skew_tolerance_ms ->
-            now + clock_skew_tolerance_ms
-
-          true ->
-            acquired_at
-        end
-
-      time_key =
-        if is_integer(sanitized_at) and clock_skew_tolerance_ms > 0 do
-          div(sanitized_at, clock_skew_tolerance_ms)
-        else
-          sanitized_at
-        end
-
-      {
-        time_key,
-        to_string(Map.get(claim, :client_id, "")),
-        to_string(Map.get(claim, :user_id, ""))
-      }
-    end)
+    {time_key, to_string(Map.get(claim, :client_id, "")), to_string(Map.get(claim, :user_id, ""))}
   end
 
   @doc """
-  Given a list of presence entries from `Phoenix.Presence.list/1`, extracts all
+  Given a list of presence entries from `c:Phoenix.Presence.list/1`, extracts all
   active field locks and deterministically resolves any conflicting claims.
 
   Returns a map of `%{field_id => lock_meta}`.
@@ -209,9 +193,11 @@ defmodule LiveCollab.Field do
     end
   end
 
+  # Ecto is optional, so dialyzer cannot see Ecto.Changeset in the PLT.
+  @dialyzer {:nowarn_function, apply_changeset_error: 3}
   defp apply_changeset_error(changeset, field, message) do
-    if Code.ensure_loaded?(Ecto.Changeset) do
-      apply(Ecto.Changeset, :add_error, [changeset, field, message])
+    if is_struct(changeset, Ecto.Changeset) and Code.ensure_loaded?(Ecto.Changeset) do
+      Ecto.Changeset.add_error(changeset, field, message)
     else
       errors = Map.get(changeset, :errors, [])
       Map.put(changeset, :errors, [{field, {message, []}} | errors])
@@ -219,11 +205,13 @@ defmodule LiveCollab.Field do
   end
 
   defp normalize_atom(val) when is_atom(val), do: val
+  # Never create atoms from strings: atoms are not garbage collected, so
+  # `String.to_atom/1` on caller-provided names can exhaust the atom table.
+  # A field name that is not an existing atom cannot be a schema field anyway;
+  # Ecto.Changeset.add_error/3 accepts the string key unchanged.
   defp normalize_atom(val) when is_binary(val) do
-    try do
-      String.to_existing_atom(val)
-    rescue
-      ArgumentError -> String.to_atom(val)
-    end
+    String.to_existing_atom(val)
+  rescue
+    ArgumentError -> val
   end
 end

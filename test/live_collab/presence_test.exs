@@ -91,4 +91,54 @@ defmodule LiveCollab.PresenceTest do
       assert kyle.active_fields == ["status"]
     end
   end
+
+  describe "identity/2" do
+    test "accepts atom or string keys and falls back sensibly" do
+      assert %{id: 1, key: "1", name: "Ann"} =
+               Presence.identity(%{"id" => 1, "name" => "Ann"}, "c")
+
+      assert %{id: "c", key: "c", name: "Guest"} = Presence.identity(%{}, "c")
+    end
+
+    test "replaces unsafe colors and drops unsafe avatar URLs" do
+      identity =
+        Presence.identity(
+          %{id: "u", color: "red;background:url(x)", avatar_url: "javascript:alert(1)"},
+          "c"
+        )
+
+      assert identity.color == Presence.deterministic_color("u")
+      assert identity.avatar_url == nil
+    end
+  end
+
+  describe "track/6 with a real Phoenix.Presence" do
+    test "regression: accepts a LiveView socket by tracking the calling process" do
+      # Phoenix.Tracker.track/5 only accepts pids; passing the socket used to
+      # raise FunctionClauseError on every connected mount.
+      topic = "live_collab:presence_test:#{System.unique_integer([:positive])}"
+      socket = %Phoenix.LiveView.Socket{}
+
+      assert {:ok, _ref} =
+               Presence.track(LiveCollab.Test.Presence, socket, topic, %{id: "u1"}, "cli_1")
+
+      assert [{pid, %{client_id: "cli_1"}}] =
+               Phoenix.Tracker.get_by_key(LiveCollab.Test.Presence, topic, "u1")
+
+      assert pid == self()
+    end
+  end
+
+  describe "extract_users/1 status" do
+    test "a user is away only when every tab is away; missing status counts as active" do
+      entries = %{
+        "a" => %{metas: [%{user_name: "A", status: :away}, %{user_name: "A", status: :away}]},
+        "b" => %{metas: [%{user_name: "B", status: :away}, %{user_name: "B", status: :active}]},
+        "c" => %{metas: [%{user_name: "C"}]}
+      }
+
+      statuses = Presence.extract_users(entries) |> Map.new(&{&1.id, &1.status})
+      assert statuses == %{"a" => :away, "b" => :active, "c" => :active}
+    end
+  end
 end

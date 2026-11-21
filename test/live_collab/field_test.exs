@@ -199,4 +199,66 @@ defmodule LiveCollab.FieldTest do
       assert %{errors: []} = Field.validate_not_locked(changeset, :email, locks, "c_bob")
     end
   end
+
+  describe "resolve_conflict/2 determinism (regression)" do
+    test "the winner does not depend on the evaluating node's clock" do
+      # Previously future timestamps were clamped to `now + tolerance` using the
+      # local clock, so nodes evaluating at different times (or with skewed
+      # clocks) could disagree. The result must be a pure function of the claims.
+      far_future = System.system_time(:millisecond) + 3_600_000
+
+      claims = [
+        %{client_id: "cli_b", user_id: "b", acquired_at: far_future},
+        %{client_id: "cli_a", user_id: "a", acquired_at: far_future + 400}
+      ]
+
+      winners =
+        for perm <- [claims, Enum.reverse(claims)], tolerance <- [0, 500] do
+          {tolerance, LiveCollab.Field.resolve_conflict(perm, tolerance).client_id}
+        end
+
+      assert {0, "cli_b"} in winners
+      assert Enum.uniq(Enum.filter(winners, &(elem(&1, 0) == 0))) == [{0, "cli_b"}]
+      assert Enum.uniq(Enum.filter(winners, &(elem(&1, 0) == 500))) |> length() == 1
+    end
+
+    test "claims without a valid timestamp always lose" do
+      claims = [
+        %{client_id: "cli_a", acquired_at: nil},
+        %{client_id: "cli_b", acquired_at: -5},
+        %{client_id: "cli_z", acquired_at: 9_000_000_000_000}
+      ]
+
+      assert LiveCollab.Field.resolve_conflict(claims, 500).client_id == "cli_z"
+    end
+
+    test "order of arrival never changes the winner (all permutations)" do
+      claims =
+        for {id, at} <- [{"c", 1_000}, {"a", 1_400}, {"b", 1_499}, {"d", 999}],
+            do: %{client_id: id, user_id: id, acquired_at: at}
+
+      winners =
+        for perm <- permutations(claims), into: MapSet.new() do
+          LiveCollab.Field.resolve_conflict(perm, 500).client_id
+        end
+
+      # 999 is in window 1, the others in window 2 -> "d" wins on time.
+      assert MapSet.to_list(winners) == ["d"]
+    end
+
+    defp permutations([]), do: [[]]
+    defp permutations(list), do: for(x <- list, rest <- permutations(list -- [x]), do: [x | rest])
+  end
+
+  describe "validate_not_locked/5 atom safety (regression)" do
+    test "does not create atoms from unknown field names" do
+      name = "never_seen_field_#{System.unique_integer([:positive])}"
+      locks = %{name => %{client_id: "other", user_name: "Eve"}}
+
+      changeset = LiveCollab.Field.validate_not_locked(%{errors: []}, name, locks, "me")
+
+      assert [{^name, {"is currently being edited by Eve", []}}] = changeset.errors
+      assert_raise ArgumentError, fn -> String.to_existing_atom(name) end
+    end
+  end
 end

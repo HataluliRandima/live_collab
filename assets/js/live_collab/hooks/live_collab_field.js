@@ -1,158 +1,214 @@
 /**
  * LiveCollab - Collaborative Field Hook
  *
- * Provides real-time field-level presence and advisory locking for form inputs.
+ * Field-level presence and advisory locking for form inputs.
  *
- * Capabilities:
- * - Focus/blur lifecycle tracking with atomic field transitions (no focus/blur flicker)
- * - Deterministic conflict handling (reacts to `live_collab:lock_lost` from server)
- * - Accessible ARIA state management (`aria-readonly`, `aria-describedby`)
- * - Tab/Window isolation using unique tab-session client UUIDs
- * - Graceful cleanup on hook destroy / navigation
+ * - Focus claims the field; blur (debounced 80ms) releases it. The blur names
+ *   the field it releases, so a late blur from the previous input never releases
+ *   the input that now has focus.
+ * - Lock state comes from the server-rendered `data-collab-locked` attribute,
+ *   which is already computed relative to this LiveView's client.
+ * - `live_collab:lock_lost` blurs the input, marks it read-only and dispatches a
+ *   bubbling `live_collab:conflict` DOM event for app-level notifications.
+ * - A claim is released when the hook is destroyed, including when a blur was
+ *   still pending.
+ * - "Ask to edit": `live_collab:lock_granted` (the holder handed over) focuses
+ *   the input, which claims it.
+ * - Conflict-aware forms: `live_collab:field_changed` (someone saved this field)
+ *   updates an input you are not editing and highlights it for 2 s
+ *   (`collab-remote-updated`); `live_collab:field_conflict` marks an input you
+ *   are editing with `collab-conflict` instead of touching your text. The
+ *   `live_collab:apply_remote` DOM event (sent by "Use theirs" in
+ *   `<.field_change_notice>`) puts the saved value in and fires `input`.
+ *   Bubbling `live_collab:remote_change` DOM events report both cases.
  */
 
-// Generate or retrieve persistent tab-level client identifier (isolated per browser tab)
-function getTabClientId() {
-  const KEY = "live_collab_tab_id";
-  try {
-    let id = window.sessionStorage.getItem(KEY);
-    if (!id) {
-      id = typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-      window.sessionStorage.setItem(KEY, id);
-    }
-    return id;
-  } catch (_e) {
-    // Fallback if sessionStorage is blocked
-    return "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-  }
-}
+import { safePush } from "../utils.js";
+
+const BLUR_DEBOUNCE_MS = 80;
+const HIGHLIGHT_MS = 2000;
 
 export const LiveCollabField = {
   mounted() {
-    this.clientId = getTabClientId();
-    this.fieldId = this.el.dataset.collabField || this.el.name || this.el.id;
+    this.fieldId = this.readFieldId();
     this.blurTimer = null;
+    this.hasClaim = false;
     this.isLockedByOther = false;
 
     if (!this.fieldId) {
-      console.warn("[LiveCollab] Hook mounted on input without data-collab-field, name, or id attribute:", this.el);
+      console.warn("[LiveCollab] LiveCollabField mounted without data-collab-field, name or id:", this.el);
       return;
     }
 
-    // Attach event listeners
     this.handleFocus = this.handleFocus.bind(this);
     this.handleBlur = this.handleBlur.bind(this);
-
     this.el.addEventListener("focus", this.handleFocus);
     this.el.addEventListener("blur", this.handleBlur);
 
-    // Handle server-directed lock loss (e.g. lost deterministic tie-break or split-brain resolution)
-    this.handleLockLost = ({ field, locked_by }) => {
-      if (field === this.fieldId) {
-        this.el.blur();
-        this.el.setAttribute("readonly", "readonly");
-        this.el.setAttribute("aria-readonly", "true");
-        this.el.classList.add("collab-locked", "collab-lock-lost-pulse");
+    // The server also pushes "live_collab:lock_lost:<field>" for backwards
+    // compatibility; subscribing to both would handle every loss twice.
+    this.handleEvent("live_collab:lock_lost", (payload) => this.handleLockLost(payload));
+    this.handleEvent("live_collab:lock_granted", (payload) => this.handleLockGranted(payload));
+    this.handleEvent("live_collab:field_changed", (payload) => this.handleRemoteChange(payload, false));
+    this.handleEvent("live_collab:field_conflict", (payload) => this.handleRemoteChange(payload, true));
+    this.handleEvent("live_collab:change_dismissed", (payload) => {
+      if (payload && payload.field === this.fieldId) this.el.classList.remove("collab-conflict");
+    });
 
-        // Dispatch a custom DOM event so the application UI can show an inline notification or toast
-        this.el.dispatchEvent(new CustomEvent("live_collab:conflict", {
-          bubbles: true,
-          detail: { field, locked_by }
-        }));
-      }
-    };
+    this.handleApplyRemote = this.handleApplyRemote.bind(this);
+    this.el.addEventListener("live_collab:apply_remote", this.handleApplyRemote);
+    this.highlightTimer = null;
 
-    this.handleEvent(`live_collab:lock_lost:${this.fieldId}`, this.handleLockLost);
-    this.handleEvent("live_collab:lock_lost", this.handleLockLost);
-
-    // Initial state check from DOM attributes
     this.syncLockState();
   },
 
   updated() {
-    // Re-sync fieldId in case dynamic form re-rendered
-    const newFieldId = this.el.dataset.collabField || this.el.name || this.el.id;
+    const newFieldId = this.readFieldId();
     if (newFieldId !== this.fieldId) {
+      // The input was re-purposed for another field: release the old claim.
+      this.releaseClaim();
       this.fieldId = newFieldId;
     }
     this.syncLockState();
   },
 
   destroyed() {
-    if (this.blurTimer) {
-      clearTimeout(this.blurTimer);
-      this.blurTimer = null;
+    if (this.handleFocus) {
+      this.el.removeEventListener("focus", this.handleFocus);
+      this.el.removeEventListener("blur", this.handleBlur);
+      this.el.removeEventListener("live_collab:apply_remote", this.handleApplyRemote);
+    }
+    clearTimeout(this.highlightTimer);
+    this.releaseClaim();
+  },
+
+  handleLockGranted(payload) {
+    if (!payload || payload.field !== this.fieldId) return;
+    // The server already dropped the previous holder's lock for this client;
+    // unlock locally so the focus below is allowed to claim the field.
+    this.isLockedByOther = false;
+    this.applyLockedState(false);
+    this.el.focus();
+  },
+
+  handleRemoteChange(payload, conflict) {
+    if (!payload || payload.field !== this.fieldId) return;
+    const value = payload.value == null ? "" : String(payload.value);
+    const editing = conflict || document.activeElement === this.el;
+
+    if (editing) {
+      // Never overwrite text the user is typing; <.field_change_notice> offers the choice.
+      this.el.classList.add("collab-conflict");
+    } else {
+      this.setValue(value);
+      this.highlight();
     }
 
-    this.el.removeEventListener("focus", this.handleFocus);
-    this.el.removeEventListener("blur", this.handleBlur);
+    this.el.dispatchEvent(
+      new CustomEvent("live_collab:remote_change", {
+        bubbles: true,
+        detail: { field: payload.field, value, by: payload.by, applied: !editing }
+      })
+    );
+  },
 
-    // Release lock on unmount if we were actively focused
-    if (document.activeElement === this.el) {
-      this.pushEvent("live_collab:field_blur", {
-        field: this.fieldId,
-        client_id: this.clientId
-      });
+  handleApplyRemote(event) {
+    const value = event && event.detail ? event.detail.value : undefined;
+    if (value === undefined) return;
+    this.setValue(value == null ? "" : String(value));
+    this.el.classList.remove("collab-conflict");
+    this.highlight();
+    // Let phx-change forms (and any other listeners) see the new value.
+    this.el.dispatchEvent(new Event("input", { bubbles: true }));
+  },
+
+  setValue(value) {
+    if (this.el.type === "checkbox" || this.el.type === "radio") {
+      this.el.checked = value === "true" || value === this.el.value;
+    } else {
+      this.el.value = value;
     }
+  },
+
+  highlight() {
+    this.el.classList.add("collab-remote-updated");
+    clearTimeout(this.highlightTimer);
+    this.highlightTimer = setTimeout(() => this.el.classList.remove("collab-remote-updated"), HIGHLIGHT_MS);
+  },
+
+  readFieldId() {
+    return this.el.dataset.collabField || this.el.name || this.el.id || null;
   },
 
   handleFocus(_event) {
-    // Cancel any pending blur timer from rapid field switching
     if (this.blurTimer) {
       clearTimeout(this.blurTimer);
       this.blurTimer = null;
     }
 
-    // If another user already locks this field, do not attempt to lock
-    if (this.isLockedByOther) {
-      return;
-    }
+    if (this.isLockedByOther || this.hasClaim) return;
 
-    // Send focus event to LiveView
-    this.pushEvent("live_collab:field_focus", {
-      field: this.fieldId,
-      client_id: this.clientId
-    });
+    if (safePush(this, "live_collab:field_focus", { field: this.fieldId })) {
+      this.hasClaim = true;
+    }
   },
 
   handleBlur(_event) {
-    // Debounce blur by 80ms to avoid lock flapping when tabbing between inputs
-    // or when focus shifts momentarily within the document
+    if (this.blurTimer) clearTimeout(this.blurTimer);
+
+    // Debounced so focus moving momentarily (e.g. to a date picker) does not flap the lock.
+    this.blurTimer = setTimeout(() => {
+      this.blurTimer = null;
+      this.releaseClaim();
+    }, BLUR_DEBOUNCE_MS);
+  },
+
+  releaseClaim() {
     if (this.blurTimer) {
       clearTimeout(this.blurTimer);
+      this.blurTimer = null;
     }
 
-    this.blurTimer = setTimeout(() => {
-      this.pushEvent("live_collab:field_blur", {
-        field: this.fieldId,
-        client_id: this.clientId
-      });
-      this.blurTimer = null;
-    }, 80);
+    if (this.hasClaim) {
+      this.hasClaim = false;
+      safePush(this, "live_collab:field_blur", { field: this.fieldId });
+    }
+  },
+
+  handleLockLost(payload) {
+    if (!payload || payload.field !== this.fieldId) return;
+
+    this.hasClaim = false;
+    this.isLockedByOther = true;
+    if (document.activeElement === this.el) this.el.blur();
+    this.applyLockedState(true);
+    this.el.classList.add("collab-lock-lost-pulse");
+
+    this.el.dispatchEvent(
+      new CustomEvent("live_collab:conflict", {
+        bubbles: true,
+        detail: { field: payload.field, locked_by: payload.locked_by }
+      })
+    );
   },
 
   syncLockState() {
-    const isLockedAttr = this.el.dataset.collabLocked === "true";
-    const lockedByClient = this.el.dataset.collabLockedByClient;
+    this.isLockedByOther = this.el.dataset.collabLocked === "true";
+    this.applyLockedState(this.isLockedByOther);
+  },
 
-    // It is locked by someone else if marked locked and not by our own tab client ID
-    this.isLockedByOther = isLockedAttr && lockedByClient !== this.clientId;
+  applyLockedState(locked) {
+    const manageReadonly = this.el.dataset.collabReadonly !== "false";
 
-    if (this.isLockedByOther) {
-      if (this.el.dataset.collabReadonly !== "false") {
-        this.el.setAttribute("readonly", "readonly");
-      }
+    if (locked) {
+      if (manageReadonly) this.el.setAttribute("readonly", "readonly");
       this.el.setAttribute("aria-readonly", "true");
       this.el.classList.add("collab-locked");
     } else {
-      // Only remove readonly if it was added for collaboration locking
-      if (this.el.dataset.collabReadonly !== "false" && this.el.hasAttribute("readonly") && !this.el.dataset.defaultReadonly) {
-        this.el.removeAttribute("readonly");
-      }
+      // Only remove readonly that LiveCollab added; data-default-readonly opts out.
+      if (manageReadonly && !this.el.dataset.defaultReadonly) this.el.removeAttribute("readonly");
       this.el.removeAttribute("aria-readonly");
-      this.el.classList.remove("collab-locked");
+      this.el.classList.remove("collab-locked", "collab-lock-lost-pulse");
     }
   }
 };

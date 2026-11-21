@@ -45,8 +45,8 @@ defmodule LiveCollab.Cursor do
   """
   @spec validate_coordinates(term(), term()) :: {:ok, float(), float()} | {:error, atom()}
   def validate_coordinates(x, y) do
-    with {:ok, nx} <- parse_number(x),
-         {:ok, ny} <- parse_number(y),
+    with {:ok, nx} <- coordinate(x),
+         {:ok, ny} <- coordinate(y),
          :ok <- validate_bounds(nx, ny) do
       {:ok, nx, ny}
     end
@@ -63,12 +63,7 @@ defmodule LiveCollab.Cursor do
           container_id :: String.t() | nil
         ) :: cursor_payload()
   def build_payload(client_id, user, x, y, container_id \\ nil) do
-    user_id = Map.get(user, :id) || Map.get(user, "id") || client_id
-    user_name = Map.get(user, :name) || Map.get(user, "name") || "Collaborator"
-
-    user_color =
-      Map.get(user, :color) || Map.get(user, "color") ||
-        LiveCollab.Presence.deterministic_color(user_id)
+    {user_id, user_name, user_color} = LiveCollab.Presence.display_fields(user, client_id)
 
     %{
       client_id: client_id,
@@ -82,26 +77,14 @@ defmodule LiveCollab.Cursor do
     }
   end
 
-  defp parse_number(val) when is_float(val) do
-    if is_finite(val), do: {:ok, val}, else: {:error, :non_finite_number}
-  end
-
-  defp parse_number(val) when is_integer(val) do
-    {:ok, val * 1.0}
-  end
-
-  defp parse_number(val) when is_binary(val) do
-    case Float.parse(val) do
-      {num, ""} -> parse_number(num)
-      _ -> {:error, :invalid_coordinate_format}
+  # Error atoms are part of the public contract (:invalid_coordinate_format,
+  # :invalid_coordinate_type); keep them stable.
+  defp coordinate(value) do
+    case LiveCollab.Validation.number(value) do
+      {:ok, num} -> {:ok, num}
+      {:error, :invalid_number_type} -> {:error, :invalid_coordinate_type}
+      {:error, _} -> {:error, :invalid_coordinate_format}
     end
-  end
-
-  defp parse_number(_invalid), do: {:error, :invalid_coordinate_type}
-
-  defp is_finite(num) when is_float(num) do
-    # In Erlang/Elixir, floats can be checked against infinity / NaN
-    not (num > 1.0e308 or num < -1.0e308 or num != num)
   end
 
   # Allow slight margins [-0.2, 1.2] for smooth mouse-out tracking before cursor_left triggers
@@ -113,4 +96,3 @@ defmodule LiveCollab.Cursor do
     end
   end
 end
-

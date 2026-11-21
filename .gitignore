@@ -18,3 +18,12 @@ node_modules/
 npm-debug.log*
 yarn-error.log*
 
+
+# Erlang VM crash dumps
+erl_crash.dump
+
+# Benchmark output (bench/presence_rebuild.exs, test/bench)
+/bench/results/
+
+# Dialyzer PLTs
+/priv/plts/

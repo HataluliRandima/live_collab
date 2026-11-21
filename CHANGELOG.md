@@ -5,6 +5,79 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.5.0] - 2026-11-19
+
+Earlier versions were only tested against an in-memory Presence mock and **crashed
+on every connected mount against a real `Phoenix.Presence`**. Upgrading is strongly
+recommended. See `guides/guarantees.md` for what LiveCollab does and does not guarantee.
+
+### Fixed
+- **Critical:** `track/4` passed the LiveView socket to `Phoenix.Tracker`, which
+  requires a pid (`FunctionClauseError` on connected mount). The same bug affected
+  untrack/update. Without an explicit `:pubsub`, `track/4` also raised; the PubSub
+  server is now read from the Presence module.
+- **Security:** stored XSS in the cursor hook (`innerHTML` with user names/colors);
+  CSS injection via unvalidated user colors; inline-JS `onclick` in `<.follow_pill>`;
+  a late-joining viewer could stop an active presentation; unvalidated
+  `container_id`/`anchor_element_id` rebroadcast to all peers; `String.to_atom/1`
+  on field names; unknown or malformed `live_collab:*` events reached (and could
+  crash) the app's `handle_event/3`; several events were not rate limited.
+- Tabbing between fields released the newly focused field's lock (late blur).
+- `Field.resolve_conflict/2` depended on the local clock, so nodes could disagree.
+- Re-tracking raised (hooks attached twice); in-flight messages for an old topic
+  crashed the app's `handle_info/2` after untrack/re-track.
+- `RateLimiter` accepted invalid rates, bursts and negative costs, and could
+  double-credit time.
+- JS: lock leak when a field was destroyed during the blur debounce; duplicate
+  `lock_lost` handling; departed cursors and selections never removed; a perpetual
+  `requestAnimationFrame` loop; listener leaks; `pushEvent` throwing after disconnect.
+- `import "live_collab"` could not resolve (`package.json` was not at the package root).
+- No hook could mount in a real browser: LiveView requires a DOM `id` on every
+  `phx-hook` element, and none of the helpers or components rendered one. They
+  now emit a deterministic id (override with `id: "..."`, omit with `id: false`).
+- Cursor and selection overlays appended by the hooks were discarded by the next
+  LiveView re-render. Components now render the overlay with
+  `phx-update="ignore"` (new `<.overlay>` for custom containers), and hooks
+  re-attach a self-created overlay after a patch. Hook-drawn elements no longer
+  depend on Tailwind classes for positioning.
+
+### Changed
+- High-frequency events no longer re-render the sender: rate-limiter state moved
+  from assigns to `socket.private` (`@collab_rate_limiter` removed).
+- Each LiveView keeps a local replica of the room's Presence entries, updated from
+  `presence_diff` payloads, instead of calling `Presence.list/1` (a `GenServer.call`
+  into a Tracker shard) on every change; rebuilds are coalesced and throttled
+  (`presence_sync_interval_ms`, default 50). Measured join-storm convergence:
+  N=100 17.4 s → 2.3 s, N=500 464 s → 218 s; memory per LiveView is higher (see README).
+- Separate rate-limit bucket for Presence writes (`presence_rate_per_sec` 20, `presence_burst_limit` 40).
+- Configuration is validated; invalid values raise `ArgumentError`.
+- `sanitize_selected_ids/1` drops oversized ids instead of truncating them.
+- `use LiveCollab.LiveView` only imports components (the injected callbacks were unreachable).
+- JS hooks no longer send a client-side `client_id`; follow events are handled on `window`.
+- Requires Elixir `~> 1.15` and `phoenix_live_view ~> 1.0`.
+
+### Added
+- "Ask to edit" lock handoff: `<.field_indicator asks={@collab_lock_asks}>` asks
+  the holder, `<.lock_requests>` shows Hand over / Keep editing, and a handover
+  focuses the requester's input. Requests are validated, rate limited, and only
+  answerable by the holder who received them.
+- Conflict-aware forms: `LiveCollab.broadcast_changes/3` announces saved values;
+  idle inputs update and highlight, while a collaborator editing the field gets
+  `<.field_change_notice>` (Use theirs / Keep mine) instead of losing their text.
+  `notify_changes: true` delivers a message so the app can reload its data.
+- Away / idle status: `<.status_reporter>` and the `LiveCollabStatus` hook mark a
+  tab away when hidden or idle; `@collab_users` carries `status`; avatars dim away
+  users; `[:live_collab, :status, :changed]` telemetry.
+- `auto_follow` attribute on `<.viewport_container>`.
+- `LiveCollab.Telemetry`: events for sessions, presence rebuilds, locks, rate-limited
+  and rejected events, and spotlight; `attach_default_logger/1`.
+- `live_collab:peers_left` push event; immediate `lock_lost` when focusing a held field;
+  `live_collab:local_selection` DOM API for reporting selections.
+- Integration tests against a real Presence, multi-node tests (`:peer`), JS hook tests,
+  benchmarks, CI, and CONTRIBUTING / SECURITY / CODE_OF_CONDUCT and guides.
+
 ## [0.4.0] - 2026-11-02
 
 ### Security & Hardening (Red Team Remediation)

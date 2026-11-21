@@ -10,6 +10,7 @@ defmodule LiveCollab.Components do
   alias LiveCollab.Element
   alias LiveCollab.Field
   alias LiveCollab.Presence
+  alias Phoenix.LiveView.JS
 
   @doc """
   Renders an accessible avatar stack for active collaborative users.
@@ -37,7 +38,10 @@ defmodule LiveCollab.Components do
   attr :max, :integer, default: 4, doc: "Maximum visible avatars before overflow indicator"
   attr :size, :string, default: "md", values: ["xs", "sm", "md", "lg"]
   attr :class, :string, default: nil, doc: "Optional CSS classes on wrapper"
-  attr :show_tabs_count, :boolean, default: true, doc: "Show count badge if user has multiple tabs"
+
+  attr :show_tabs_count, :boolean,
+    default: true,
+    doc: "Show count badge if user has multiple tabs"
 
   slot :user_avatar, doc: "Custom avatar rendering slot for each user"
   slot :overflow_indicator, doc: "Custom overflow rendering slot"
@@ -97,14 +101,24 @@ defmodule LiveCollab.Components do
 
   def avatar(assigns) do
     tabs_count = Map.get(assigns.user, :tabs_count, 1)
-    assigns = assign(assigns, :tabs_count, tabs_count)
+    away? = Map.get(assigns.user, :status) == :away
+
+    assigns =
+      assigns
+      |> assign(:tabs_count, tabs_count)
+      |> assign(:away?, away?)
+      |> assign(:away_label, if(away?, do: " (away)", else: ""))
 
     ~H"""
     <div
-      class="relative group focus:outline-none"
+      class={[
+        "relative group focus:outline-none transition-opacity",
+        @away? && "live-collab-away opacity-40 grayscale"
+      ]}
       tabindex="0"
-      aria-label={"Collaborator #{@user.name}"}
-      title={"#{@user.name}#{if @tabs_count > 1, do: " (#{@tabs_count} tabs)", else: ""}"}
+      data-collab-status={if @away?, do: "away", else: "active"}
+      aria-label={"Collaborator #{@user.name}#{@away_label}"}
+      title={"#{@user.name}#{@away_label}#{if @tabs_count > 1, do: " (#{@tabs_count} tabs)", else: ""}"}
     >
       <%= if @user.avatar_url do %>
         <img
@@ -121,7 +135,7 @@ defmodule LiveCollab.Components do
             "rounded-full ring-2 ring-white text-white font-medium flex items-center justify-center shadow-sm select-none",
             avatar_size_class(@size)
           ]}
-          style={"background-color: #{@user.color};"}
+          style={"background-color: #{css_color(@user[:color], @user[:id])};"}
         >
           <%= @user.initials %>
         </div>
@@ -151,10 +165,19 @@ defmodule LiveCollab.Components do
         locks={@collab_locks}
         current_client_id={@collab_client_id}
       />
+
+  Pass `asks={@collab_lock_asks}` to add an **Ask to edit** button. It sends a
+  request to the current holder, who sees it in `lock_requests/1`; the button
+  then shows "Request sent" or "Declined" until the lock changes hands.
   """
   attr :field, :string, required: true, doc: "The field identifier"
   attr :locks, :map, required: true, doc: "The @collab_locks map"
   attr :current_client_id, :string, default: nil, doc: "The current tab client ID"
+
+  attr :asks, :map,
+    default: nil,
+    doc: "The @collab_lock_asks map; enables the Ask to edit button when given"
+
   attr :class, :string, default: nil
 
   def field_indicator(assigns) do
@@ -165,6 +188,7 @@ defmodule LiveCollab.Components do
       assigns
       |> assign(:lock, lock)
       |> assign(:is_other, is_other)
+      |> assign(:ask, assigns.asks && Map.get(assigns.asks, assigns.field))
 
     ~H"""
     <%= if @is_other do %>
@@ -175,13 +199,158 @@ defmodule LiveCollab.Components do
           "live-collab-field-indicator inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-xs font-medium text-white shadow-sm transition-all duration-150 animate-fadeIn",
           @class
         ]}
-        style={"background-color: #{@lock.user_color || "#4F46E5"};"}
+        style={"background-color: #{css_color(@lock[:user_color], @lock[:user_id])};"}
       >
         <span class="inline-block w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
         <span class="truncate max-w-[140px]"><%= @lock.user_name %> is editing</span>
+        <button
+          :if={@asks && @ask != :pending}
+          type="button"
+          class="live-collab-ask-button ml-1 px-1.5 rounded bg-white/20 hover:bg-white/30"
+          phx-click="live_collab:lock_request"
+          phx-value-field={@field}
+        >
+          {if @ask == :declined, do: "Declined · ask again", else: "Ask to edit"}
+        </button>
+        <span :if={@ask == :pending} class="live-collab-ask-pending ml-1 opacity-80">
+          Request sent…
+        </span>
       </div>
     <% end %>
     """
+  end
+
+  @doc """
+  Renders pending "Ask to edit" requests for fields this client holds, with
+  **Hand over** and **Keep editing** buttons.
+
+  Handing over releases this client's lock and tells the requester's
+  `LiveCollabField` hook to focus the input, which claims it. Pass `field` to
+  render only the requests for one field (e.g. next to its input).
+
+  ## Examples
+
+      <.lock_requests requests={@collab_lock_requests} />
+      <.lock_requests requests={@collab_lock_requests} field="order.name" />
+  """
+  attr :requests, :map, required: true, doc: "The @collab_lock_requests map"
+  attr :field, :string, default: nil, doc: "Only show requests for this field"
+  attr :class, :string, default: nil
+
+  def lock_requests(assigns) do
+    entries =
+      for {field, reqs} <- assigns.requests,
+          is_nil(assigns.field) or field == assigns.field,
+          req <- reqs,
+          do: {field, req}
+
+    assigns = assign(assigns, :entries, entries)
+
+    ~H"""
+    <div
+      :for={{field, req} <- @entries}
+      role="alert"
+      class={["live-collab-lock-request inline-flex items-center gap-2 px-2 py-1 rounded text-xs", @class]}
+    >
+      <span
+        class="inline-block w-2 h-2 rounded-full"
+        style={"background-color: #{css_color(req.user_color, req.client_id)};"}
+      >
+      </span>
+      <span>{req.user_name} wants to edit <strong>{field}</strong></span>
+      <button
+        type="button"
+        phx-click="live_collab:lock_handoff"
+        phx-value-field={field}
+        phx-value-to={req.client_id}
+        phx-value-accept="true"
+      >
+        Hand over
+      </button>
+      <button
+        type="button"
+        phx-click="live_collab:lock_handoff"
+        phx-value-field={field}
+        phx-value-to={req.client_id}
+        phx-value-accept="false"
+      >
+        Keep editing
+      </button>
+    </div>
+    """
+  end
+
+  @doc """
+  Renders a conflict notice when another collaborator saved a field this client
+  was editing (see `LiveCollab.broadcast_changes/3`), with **Use theirs** and
+  **Keep mine** buttons.
+
+  "Use theirs" puts the saved value into the input (dispatching an `input`
+  event, so `phx-change` forms see it); "Keep mine" leaves the input alone.
+  Both dismiss the notice.
+
+  `input_id` defaults to the id `collab_attrs/4` generates for `field`; set it if
+  you passed your own `id` there.
+
+  ## Examples
+
+      <.field_change_notice field="order.name" changes={@collab_remote_changes} />
+  """
+  attr :field, :string, required: true
+  attr :changes, :map, required: true, doc: "The @collab_remote_changes map"
+  attr :input_id, :string, default: nil
+  attr :class, :string, default: nil
+
+  def field_change_notice(assigns) do
+    change = Map.get(assigns.changes, assigns.field)
+    input_id = assigns.input_id || field_dom_id(assigns.field)
+    dismiss = JS.push("live_collab:dismiss_change", value: %{field: assigns.field})
+
+    assigns =
+      assigns
+      |> assign(:change, change)
+      |> assign(:keep_mine, dismiss)
+      |> assign(
+        :use_theirs,
+        change &&
+          JS.dispatch("live_collab:apply_remote",
+            to: "#" <> input_id,
+            detail: %{value: change.value}
+          )
+          |> JS.push("live_collab:dismiss_change", value: %{field: assigns.field})
+      )
+
+    ~H"""
+    <div
+      :if={@change}
+      role="alert"
+      class={["live-collab-change-notice inline-flex items-center gap-2 px-2 py-1 rounded text-xs", @class]}
+    >
+      <span
+        class="inline-block w-2 h-2 rounded-full"
+        style={"background-color: #{css_color(@change.by_color, @change.by_client_id)};"}
+      >
+      </span>
+      <span>
+        {@change.by_name} saved “{display_value(@change.value)}” while you were editing.
+      </span>
+      <button type="button" phx-click={@use_theirs}>Use theirs</button>
+      <button type="button" phx-click={@keep_mine}>Keep mine</button>
+    </div>
+    """
+  end
+
+  @doc """
+  The DOM id `collab_attrs/4` generates for `field` (when no `:id` is given).
+  """
+  @spec field_dom_id(String.t()) :: String.t()
+  def field_dom_id(field), do: hook_dom_id("live-collab-field", field)
+
+  defp display_value(nil), do: ""
+
+  defp display_value(value) do
+    text = to_string(value)
+    if String.length(text) > 80, do: String.slice(text, 0, 79) <> "…", else: text
   end
 
   @doc """
@@ -243,7 +412,7 @@ defmodule LiveCollab.Components do
                     "rounded-full ring-1 ring-white text-white font-medium flex items-center justify-center select-none",
                     avatar_size_class(@size)
                   ]}
-                  style={"background-color: #{user.user_color};"}
+                  style={"background-color: #{css_color(user[:user_color], user[:user_id])};"}
                 >
                   <%= Presence.initials(user.user_name) %>
                 </div>
@@ -327,7 +496,7 @@ defmodule LiveCollab.Components do
                   "rounded-full ring-1 ring-white text-white font-medium flex items-center justify-center select-none",
                   avatar_size_class(@size)
                 ]}
-                style={"background-color: #{user.user_color};"}
+                style={"background-color: #{css_color(user[:user_color], user[:user_id])};"}
               >
                 <%= Presence.initials(user.user_name) %>
               </div>
@@ -358,6 +527,32 @@ defmodule LiveCollab.Components do
   end
 
   @doc """
+  Reports this tab's away/idle status to collaborators.
+
+  Render it once per LiveView that calls `LiveCollab.track/4`. The
+  `LiveCollabStatus` hook marks the tab `:away` when the page is hidden (another
+  tab or a minimised window) or after `idle_after` milliseconds without pointer,
+  keyboard, touch or scroll activity, and `:active` again on the next
+  interaction. Only changes are sent.
+
+  `@collab_users` then carries `status: :active | :away` per user (away only if
+  every tab of that user is away), and `<.avatar_stack>` dims away users.
+
+  ## Examples
+
+      <.status_reporter />
+      <.status_reporter idle_after={30_000} />
+  """
+  attr :idle_after, :integer, default: 60_000, doc: "Milliseconds of inactivity before away"
+  attr :id, :string, default: "live-collab-status", doc: "DOM id (required by LiveView hooks)"
+
+  def status_reporter(assigns) do
+    ~H"""
+    <div id={@id} phx-hook="LiveCollabStatus" data-collab-idle-after={@idle_after} hidden></div>
+    """
+  end
+
+  @doc """
   Renders a high-performance collaborative cursor container layer.
   Attaches `phx-hook="LiveCollabCursor"` and prepares the hardware-accelerated SVG overlay.
 
@@ -367,19 +562,39 @@ defmodule LiveCollab.Components do
         <div>Your collaborative board content</div>
       </.cursor_layer>
   """
-  attr :container_id, :string, default: "default", doc: "Identifier for container-relative coordinate mapping"
+  attr :container_id, :string,
+    default: "default",
+    doc: "Identifier for container-relative coordinate mapping"
+
   attr :throttle, :integer, default: 30, doc: "Client throttle in milliseconds (~33 fps)"
-  attr :deadband, :float, default: 0.0015, doc: "Normalized distance threshold to avoid jitter broadcasts"
+
+  attr :deadband, :float,
+    default: 0.0015,
+    doc: "Normalized distance threshold to avoid jitter broadcasts"
+
   attr :class, :string, default: nil, doc: "CSS classes on the outer container"
+
+  attr :id, :string,
+    default: nil,
+    doc: "DOM id (LiveView hooks require one); derived from container_id by default"
+
   slot :inner_block, required: false
 
   def cursor_layer(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :dom_id,
+        assigns.id || hook_dom_id("live-collab-cursor", assigns.container_id)
+      )
+
     ~H"""
     <div
       class={["live-collab-cursor-container relative", @class]}
-      {collab_cursor_attrs(@container_id, throttle: @throttle, deadband: @deadband)}
+      {collab_cursor_attrs(@container_id, throttle: @throttle, deadband: @deadband, id: @dom_id)}
     >
-      <%= render_slot(@inner_block) %>
+      {render_slot(@inner_block)}
+      <.overlay id={"#{@dom_id}-layer"} class="live-collab-cursor-layer z-50" />
     </div>
     """
   end
@@ -394,10 +609,24 @@ defmodule LiveCollab.Components do
       </.viewport_container>
   """
   attr :container_id, :string, default: "default"
-  attr :presenter, :boolean, default: false, doc: "Whether this client is broadcasting scroll position as presenter"
+
+  attr :presenter, :boolean,
+    default: false,
+    doc: "Whether this client is broadcasting scroll position as presenter"
+
   attr :following, :string, default: nil, doc: "Client ID of presenter to follow"
   attr :throttle, :integer, default: 40, doc: "Scroll broadcast throttle in milliseconds"
+
+  attr :auto_follow, :boolean,
+    default: false,
+    doc: "Automatically follow whoever starts presenting (manual scrolling breaks out)"
+
   attr :class, :string, default: nil
+
+  attr :id, :string,
+    default: nil,
+    doc: "DOM id (LiveView hooks require one); derived from container_id by default"
+
   slot :inner_block, required: false
 
   def viewport_container(assigns) do
@@ -407,7 +636,9 @@ defmodule LiveCollab.Components do
       {collab_viewport_attrs(@container_id,
         presenter: @presenter,
         following: @following,
-        throttle: @throttle
+        throttle: @throttle,
+        auto_follow: @auto_follow,
+        id: @id
       )}
     >
       <%= render_slot(@inner_block) %>
@@ -418,33 +649,55 @@ defmodule LiveCollab.Components do
   @doc """
   Renders an interactive pill showing who is currently presenting/leading, with
   a button to follow or unfollow.
+
+  The button dispatches a bubbling `live_collab:start_follow` /
+  `live_collab:stop_follow` DOM event (via `Phoenix.LiveView.JS.dispatch/2`, so
+  it works under a strict Content-Security-Policy). `LiveCollabViewport` hooks
+  listen for it on `window`, so the pill can be placed anywhere on the page.
+  Set `container_id` to target one specific viewport container when a page has
+  several.
   """
   attr :leader_name, :string, required: true
   attr :leader_client_id, :string, required: true
   attr :leader_color, :string, default: "#4F46E5"
   attr :is_following, :boolean, default: false
+  attr :container_id, :string, default: nil, doc: "Only this viewport container reacts"
   attr :class, :string, default: nil
 
   def follow_pill(assigns) do
+    event =
+      if assigns.is_following, do: "live_collab:stop_follow", else: "live_collab:start_follow"
+
+    detail = %{client_id: assigns.leader_client_id, container_id: assigns.container_id}
+    assigns = assign(assigns, :on_click, JS.dispatch(event, detail: detail))
+
     ~H"""
-    <div
-      class={[
-        "live-collab-follow-pill inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium shadow-md transition-all select-none",
-        if(@is_following, do: "bg-gray-900 text-white ring-2 ring-indigo-500", else: "bg-white text-gray-800 border border-gray-200"),
-        @class
-      ]}
-    >
-      <span class="w-2 h-2 rounded-full animate-pulse" style={"background-color: #{@leader_color};"}></span>
-      <span><%= @leader_name %> is presenting</span>
+    <div class={[
+      "live-collab-follow-pill inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium shadow-md transition-all select-none",
+      if(@is_following,
+        do: "bg-gray-900 text-white ring-2 ring-indigo-500",
+        else: "bg-white text-gray-800 border border-gray-200"
+      ),
+      @class
+    ]}>
+      <span
+        class="w-2 h-2 rounded-full animate-pulse"
+        style={"background-color: #{css_color(@leader_color, @leader_client_id)};"}
+      >
+      </span>
+      <span>{@leader_name} is presenting</span>
       <button
         type="button"
+        phx-click={@on_click}
         class={[
           "ml-1 px-2 py-0.5 rounded text-[11px] font-semibold transition-colors",
-          if(@is_following, do: "bg-gray-800 text-gray-200 hover:bg-gray-700", else: "bg-indigo-600 text-white hover:bg-indigo-500")
+          if(@is_following,
+            do: "bg-gray-800 text-gray-200 hover:bg-gray-700",
+            else: "bg-indigo-600 text-white hover:bg-indigo-500"
+          )
         ]}
-        onclick={"this.closest('.live-collab-viewport-container, body').dispatchEvent(new CustomEvent('#{if @is_following, do: "live_collab:stop_follow", else: "live_collab:start_follow"}', {bubbles: true, detail: {client_id: '#{@leader_client_id}'}}))"}
       >
-        <%= if @is_following, do: "Stop Following", else: "Follow" %>
+        {if @is_following, do: "Stop Following", else: "Follow"}
       </button>
     </div>
     """
@@ -455,15 +708,65 @@ defmodule LiveCollab.Components do
   """
   attr :container_id, :string, default: "default"
   attr :class, :string, default: nil
+
+  attr :id, :string,
+    default: nil,
+    doc: "DOM id (LiveView hooks require one); derived from container_id by default"
+
   slot :inner_block, required: false
 
   def selection_layer(assigns) do
+    assigns =
+      assign(
+        assigns,
+        :dom_id,
+        assigns.id || hook_dom_id("live-collab-selection", assigns.container_id)
+      )
+
     ~H"""
     <div
       class={["live-collab-selection-container relative", @class]}
-      {collab_selection_attrs(@container_id)}
+      {collab_selection_attrs(@container_id, id: @dom_id)}
     >
-      <%= render_slot(@inner_block) %>
+      {render_slot(@inner_block)}
+      <.overlay id={"#{@dom_id}-layer"} class="live-collab-selection-layer z-40" />
+    </div>
+    """
+  end
+
+  @doc """
+  Renders the overlay a `LiveCollabCursor` or `LiveCollabSelection` hook draws
+  into.
+
+  `<.cursor_layer>` and `<.selection_layer>` include one automatically. When you
+  attach a hook to your own element with `collab_cursor_attrs/2` or
+  `collab_selection_attrs/2`, render one as a direct child:
+
+      <div {collab_cursor_attrs("board")}>
+        ...
+        <LiveCollab.Components.overlay id="board-cursors" />
+      </div>
+
+  The overlay has `phx-update="ignore"`, so LiveView keeps it, and the cursors
+  drawn into it, across re-renders. Without it the hook creates its own overlay
+  and re-attaches it after LiveView patches remove it.
+  """
+  attr :id, :string, required: true
+  attr :class, :string, default: nil
+
+  def overlay(assigns) do
+    ~H"""
+    <div
+      id={@id}
+      phx-update="ignore"
+      data-collab-layer
+      aria-hidden="true"
+      class={[
+        "pointer-events-none absolute inset-0 overflow-hidden select-none",
+        @class
+      ]}
+      style="position: absolute; inset: 0; pointer-events: none; overflow: hidden;"
+    >
     </div>
     """
   end
@@ -476,18 +779,22 @@ defmodule LiveCollab.Components do
 
   - `throttle` - Milliseconds between client cursor broadcasts (default `30`).
   - `deadband` - Minimum normalized coordinate delta to broadcast (default `0.0015`).
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_cursor_attrs(container_id :: String.t(), opts :: keyword()) :: list()
   def collab_cursor_attrs(container_id \\ "default", opts \\ []) do
     throttle = Keyword.get(opts, :throttle, 30)
     deadband = Keyword.get(opts, :deadband, 0.0015)
 
-    [
-      "phx-hook": "LiveCollabCursor",
-      "data-collab-container": container_id,
-      "data-collab-throttle": to_string(throttle),
-      "data-collab-deadband": to_string(deadband)
-    ]
+    hook_id("live-collab-cursor", container_id, opts) ++
+      [
+        "phx-hook": "LiveCollabCursor",
+        "data-collab-container": container_id,
+        "data-collab-throttle": to_string(throttle),
+        "data-collab-deadband": to_string(deadband)
+      ]
   end
 
   @doc """
@@ -499,6 +806,10 @@ defmodule LiveCollab.Components do
   - `presenter` - Boolean indicating if this client broadcasts scroll coordinates (default `false`).
   - `following` - Client ID string of presenter currently being followed.
   - `throttle` - Milliseconds between scroll broadcasts (default `40`).
+  - `auto_follow` - Follow a presenter automatically when a spotlight starts (default `false`).
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_viewport_attrs(container_id :: String.t(), opts :: keyword()) :: list()
   def collab_viewport_attrs(container_id \\ "default", opts \\ []) do
@@ -506,12 +817,18 @@ defmodule LiveCollab.Components do
     following = Keyword.get(opts, :following)
     throttle = Keyword.get(opts, :throttle, 40)
 
-    attrs = [
-      "phx-hook": "LiveCollabViewport",
-      "data-collab-container": container_id,
-      "data-collab-presenter": to_string(presenter),
-      "data-collab-throttle": to_string(throttle)
-    ]
+    attrs =
+      hook_id("live-collab-viewport", container_id, opts) ++
+        [
+          "phx-hook": "LiveCollabViewport",
+          "data-collab-container": container_id,
+          "data-collab-presenter": to_string(presenter),
+          "data-collab-throttle": to_string(throttle)
+        ] ++
+        if(Keyword.get(opts, :auto_follow, false),
+          do: ["data-collab-auto-follow": "true"],
+          else: []
+        )
 
     attrs =
       if following do
@@ -525,13 +842,17 @@ defmodule LiveCollab.Components do
 
   @doc """
   Generates HTML tag attributes to attach the `LiveCollabSelection` hook to a canvas or container.
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_selection_attrs(container_id :: String.t(), opts :: keyword()) :: list()
-  def collab_selection_attrs(container_id \\ "default", _opts \\ []) do
-    [
-      "phx-hook": "LiveCollabSelection",
-      "data-collab-container": container_id
-    ]
+  def collab_selection_attrs(container_id \\ "default", opts \\ []) do
+    hook_id("live-collab-selection", container_id, opts) ++
+      [
+        "phx-hook": "LiveCollabSelection",
+        "data-collab-container": container_id
+      ]
   end
 
   @doc """
@@ -545,6 +866,9 @@ defmodule LiveCollab.Components do
         name="customer[name]"
         {collab_attrs("customer.name", @collab_locks, @collab_client_id)}
       />
+  Options: `readonly: false` to keep the input editable while locked;
+  `id:` as for the other helpers (LiveView hooks require a DOM id, so one is
+  generated from the field name unless you pass `id: "..."` or `id: false`).
   """
   @spec collab_attrs(
           field :: String.t(),
@@ -558,12 +882,14 @@ defmodule LiveCollab.Components do
     holder = Field.current_holder(locks, field)
     holder_client = if holder, do: holder.client_id, else: nil
 
-    attrs = [
-      "phx-hook": "LiveCollabField",
-      "data-collab-field": field,
-      "data-collab-locked": to_string(locked_by_other),
-      "data-collab-locked-by-client": holder_client || ""
-    ]
+    attrs =
+      hook_id("live-collab-field", field, opts) ++
+        [
+          "phx-hook": "LiveCollabField",
+          "data-collab-field": field,
+          "data-collab-locked": to_string(locked_by_other),
+          "data-collab-locked-by-client": holder_client || ""
+        ]
 
     attrs =
       if readonly_on_lock and locked_by_other do
@@ -583,6 +909,9 @@ defmodule LiveCollab.Components do
 
   - `hover_intent` - Debounce in milliseconds for hover intent (e.g. `300`). Omit or `nil` for click/focus only.
   - `type` - Activity type when triggered (`:viewing` or `:selected`). Default `:viewing`.
+  LiveView only mounts hooks on elements with a DOM `id`, so an `id` is always
+  included, derived from the identifier (pass `id: "..."` to choose your own, or
+  `id: false` if the element already sets one).
   """
   @spec collab_row_attrs(
           element_id :: String.t(),
@@ -598,12 +927,14 @@ defmodule LiveCollab.Components do
     hover_intent = Keyword.get(opts, :hover_intent)
     activity_type = Keyword.get(opts, :type, :viewing)
 
-    attrs = [
-      "phx-hook": "LiveCollabElement",
-      "data-collab-element": element_id,
-      "data-collab-type": to_string(activity_type),
-      "data-collab-active": to_string(active_by_other)
-    ]
+    attrs =
+      hook_id("live-collab-element", element_id, opts) ++
+        [
+          "phx-hook": "LiveCollabElement",
+          "data-collab-element": element_id,
+          "data-collab-type": to_string(activity_type),
+          "data-collab-active": to_string(active_by_other)
+        ]
 
     attrs =
       if hover_intent && hover_intent > 0 do
@@ -618,7 +949,8 @@ defmodule LiveCollab.Components do
 
         attrs ++
           [
-            style: "--collab-element-color: #{primary_user.user_color};",
+            style:
+              "--collab-element-color: #{css_color(primary_user[:user_color], primary_user[:user_id])};",
             "aria-description": "#{summary} on this item"
           ]
       else
@@ -645,6 +977,35 @@ defmodule LiveCollab.Components do
   defp collaborator_summary([first | rest]) do
     "#{first.user_name} and #{length(rest)} others are viewing"
   end
+
+  # LiveView only mounts a phx-hook element that has a DOM id ("no DOM ID for
+  # hook" otherwise), so every helper emits one. The default is derived from the
+  # field/element/container id with every character outside [A-Za-z0-9_-]
+  # hex-escaped, which keeps it unique and safe in CSS selectors.
+  # `id: "custom"` overrides it; `id: false` omits it when the element already
+  # carries its own id.
+  defp hook_id(prefix, raw, opts) do
+    case Keyword.get(opts, :id) do
+      false -> []
+      nil -> [id: hook_dom_id(prefix, raw)]
+      id -> [id: to_string(id)]
+    end
+  end
+
+  defp hook_dom_id(prefix, raw), do: prefix <> "-" <> dom_safe(to_string(raw))
+
+  defp dom_safe(value) do
+    for <<byte <- value>>, into: "" do
+      if byte in ?a..?z or byte in ?A..?Z or byte in ?0..?9 or byte in [?-],
+        do: <<byte>>,
+        else: "_" <> Base.encode16(<<byte>>, case: :lower)
+    end
+  end
+
+  # Colors end up inside `style` attributes. HEEx escapes HTML, not CSS, so only
+  # strict hex colors are allowed through; anything else falls back to the
+  # deterministic palette color.
+  defp css_color(color, id), do: Presence.safe_color(color, id)
 
   defp avatar_size_class("xs"), do: "w-5 h-5 text-[10px]"
   defp avatar_size_class("sm"), do: "w-7 h-7 text-xs"

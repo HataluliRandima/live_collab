@@ -72,5 +72,128 @@ defmodule LiveCollab.RateLimiterTest do
       assert %RateLimiter{} = updated
     end
   end
-end
 
+  describe "invalid configuration fails loudly" do
+    test "zero, negative and non-numeric rates are rejected" do
+      for rate <- [0, -1, -0.5, "50", nil, :fast] do
+        assert_raise ArgumentError, ~r/rate/, fn -> RateLimiter.new(rate: rate) end
+      end
+    end
+
+    test "burst limits below 1 or non-numeric are rejected" do
+      for burst <- [0, 0.5, -10, "60", nil] do
+        assert_raise ArgumentError, ~r/burst/, fn -> RateLimiter.new(rate: 10, burst: burst) end
+      end
+    end
+
+    test "non-integer now_ms is rejected" do
+      assert_raise ArgumentError, ~r/now_ms/, fn -> RateLimiter.new(now_ms: 1.5) end
+    end
+
+    test "negative and non-numeric costs are rejected instead of minting tokens" do
+      limiter = RateLimiter.new(rate: 1, burst: 1, now_ms: 0)
+
+      for cost <- [-1, -100.0, "1", nil] do
+        assert_raise ArgumentError, ~r/cost/, fn -> RateLimiter.check(limiter, cost, 0) end
+      end
+    end
+
+    test "fractional rates are supported" do
+      limiter = RateLimiter.new(rate: 0.5, burst: 1, now_ms: 0)
+      {:allow, limiter} = RateLimiter.check(limiter, 1, 0)
+      {:deny, limiter} = RateLimiter.check(limiter, 1, 1_999)
+      assert {:allow, _} = RateLimiter.check(limiter, 1, 2_000)
+    end
+  end
+
+  describe "boundary conditions" do
+    test "zero-cost events are always allowed and consume nothing" do
+      limiter = RateLimiter.new(rate: 1, burst: 1, now_ms: 0)
+      {:allow, limiter} = RateLimiter.check(limiter, 1, 0)
+      assert {:allow, %{tokens: +0.0}} = RateLimiter.check(limiter, 0, 0)
+    end
+
+    test "a cost larger than the bucket is always denied" do
+      limiter = RateLimiter.new(rate: 1_000, burst: 5, now_ms: 0)
+      assert {:deny, _} = RateLimiter.check(limiter, 6, 1_000_000)
+    end
+
+    test "an event costing exactly the remaining tokens is allowed" do
+      limiter = RateLimiter.new(rate: 1, burst: 3, now_ms: 0)
+      assert {:allow, %{tokens: +0.0}} = RateLimiter.check(limiter, 3, 0)
+    end
+
+    test "tokens never exceed the burst capacity, even after very long idle periods" do
+      limiter = RateLimiter.new(rate: 1_000, burst: 10, now_ms: 0)
+      {:allow, limiter} = RateLimiter.check(limiter, 1, 0)
+      {:allow, limiter} = RateLimiter.check(limiter, 1, 9_000_000_000_000)
+      assert limiter.tokens == 9.0
+    end
+
+    test "a deny does not consume tokens but does account for refill" do
+      limiter = RateLimiter.new(rate: 10, burst: 1, now_ms: 0)
+      {:allow, limiter} = RateLimiter.check(limiter, 1, 0)
+      {:deny, limiter} = RateLimiter.check(limiter, 1, 50)
+      assert_in_delta limiter.tokens, 0.5, 1.0e-9
+      assert {:allow, _} = RateLimiter.check(limiter, 1, 100)
+    end
+  end
+
+  describe "time handling" do
+    test "a timestamp earlier than the last one refills nothing" do
+      limiter = RateLimiter.new(rate: 10, burst: 1, now_ms: 1_000)
+      {:allow, limiter} = RateLimiter.check(limiter, 1, 1_000)
+      assert {:deny, _} = RateLimiter.check(limiter, 1, 0)
+    end
+
+    test "regression: going back in time never credits the same interval twice" do
+      # Previously last_time_ms was set to the (earlier) supplied time, so the
+      # next call re-credited the interval between the two timestamps.
+      limiter = RateLimiter.new(rate: 10, burst: 1, now_ms: 1_000)
+      {:allow, limiter} = RateLimiter.check(limiter, 1, 1_000)
+      {:deny, limiter} = RateLimiter.check(limiter, 1, 500)
+      assert limiter.last_time_ms == 1_000
+      assert {:deny, _} = RateLimiter.check(limiter, 1, 1_050)
+      assert {:allow, _} = RateLimiter.check(limiter, 1, 1_100)
+    end
+
+    test "uses the monotonic clock when no time is supplied" do
+      limiter = RateLimiter.new(rate: 1, burst: 1)
+      assert {:allow, limiter} = RateLimiter.check(limiter)
+      assert {:deny, _} = RateLimiter.check(limiter)
+    end
+
+    test "steady state converges to the configured rate" do
+      limiter = RateLimiter.new(rate: 50, burst: 60, now_ms: 0)
+
+      # A client sending 1000 events/s for 10 simulated seconds.
+      {allowed, _} =
+        Enum.reduce(0..9_999, {0, limiter}, fn t, {n, l} ->
+          case RateLimiter.check(l, 1, t) do
+            {:allow, l} -> {n + 1, l}
+            {:deny, l} -> {n, l}
+          end
+        end)
+
+      # burst (60) + 10s * 50/s, within floating point rounding
+      assert allowed in 558..560
+    end
+  end
+
+  property_like_seeds = [1, 2, 3, 42, 1234]
+
+  for seed <- property_like_seeds do
+    test "invariant: 0 <= tokens <= burst for random event streams (seed #{seed})" do
+      :rand.seed(:exsss, {unquote(seed), 0, 0})
+      limiter = RateLimiter.new(rate: 37, burst: 11, now_ms: 0)
+
+      Enum.reduce(1..5_000, {limiter, 0}, fn _, {l, t} ->
+        t = t + :rand.uniform(40) - 5
+        cost = :rand.uniform(3) - 1
+        {_decision, l} = RateLimiter.check(l, cost, t)
+        assert l.tokens >= 0.0 and l.tokens <= 11.0
+        {l, t}
+      end)
+    end
+  end
+end

@@ -1,341 +1,411 @@
 # LiveCollab
 
+[![CI](https://github.com/HataluliRandima/live_collab/actions/workflows/ci.yml/badge.svg)](https://github.com/HataluliRandima/live_collab/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/live_collab.svg)](https://hex.pm/packages/live_collab)
 [![HexDocs](https://img.shields.io/badge/hex-docs-lightgreen.svg)](https://hexdocs.pm/live_collab)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/HataluliRandima/live_collab/blob/main/LICENSE)
 
-**LiveCollab** brings real-time multiplayer UI primitives to Phoenix LiveView applications.
+Multiplayer UI primitives for Phoenix LiveView: who is here, who is editing which
+field, which rows people are looking at, live cursors, presenter scroll-following
+and shared selections.
 
-Built entirely on Phoenix's native primitives—`Phoenix.Presence`, `Phoenix.PubSub`, and LiveView hooks—LiveCollab requires **no Redis, external WebSocket brokers, or third-party cloud services**.
+LiveCollab is built only on `Phoenix.Presence`, `Phoenix.PubSub` and LiveView
+hooks. It needs no Redis, no external broker and no third-party service, and it
+works across a clustered deployment.
 
----
-
-## Architectural Principles
-
-LiveCollab enforces a strict separation between two categories of collaborative events:
-
-| Category | Transport / Engine | Typical Events | LiveView Lifecycle & Diff Impact |
-| :--- | :--- | :--- | :--- |
-| **Durable Collaborative State** (Path 1) | `Phoenix.Presence` (CRDT) | User joins/leaves, active presence, field-level locks, element/row activity | Low frequency; safely updates LiveView assigns and renders reactive components |
-| **High-Frequency Ephemeral Telemetry** (Path 2) | `Phoenix.PubSub` + Client JS + `RateLimiter` | Mouse coordinates, collaborative cursors, scroll/viewport telemetry, selection marquees | **Zero assigns diffing or template re-renders; rendered directly in client JS; protected at socket boundary by token-bucket rate limiter** |
-
----
+> **Status: pre-1.0.** The API may still change between minor versions. Versions
+> before 0.5.0 crash on connected mount against a real `Phoenix.Presence`; use
+> 0.5.0 or later. See the [CHANGELOG](CHANGELOG.md).
 
 ## Features
 
-### Version 0.4.0 (Security Hardened & Cluster Resilient)
-- **Token Bucket Telemetry Rate Limiter (`LiveCollab.RateLimiter`)**: Purely functional in-memory token bucket directly in socket assigns ($O(1)$ monotonic arithmetic, zero GenServer/ETS overhead) that drops telemetry floods at the socket boundary before cluster PubSub saturation can occur.
-- **Multi-Node Cluster Clock-Skew Mitigation**: Replaces naive millisecond comparison with windowed bucketing in `LiveCollab.Field.resolve_conflict/2` (`clock_skew_tolerance_ms: 500`), guaranteeing identical deterministic tie-breaking across all nodes regardless of NTP drift or message arrival order.
-- **Client ID Injection Defense**: Completely ignores untrusted wire `params["client_id"]`, strictly enforcing server-authenticated `sock.assigns[:collab_client_id]`.
-- **Spotlight Authorization Guards**: Prevents unprivileged attendees (`role: "viewer"`, `collab_can_present?: false`) from hijacking viewports or disrupting ongoing presentations.
-- **Selection Marquee Bounding**: Sanitizes and truncates collaborative selection arrays to at most 100 items and 255 bytes per ID, neutralizing memory exhaustion attacks.
-- **Lock Seniority Preservation**: Re-focusing an already held field in `Phoenix.Presence` preserves the original `acquired_at` timestamp rather than resetting lock seniority.
+| Feature | Transport | Server pieces | Client hook |
+| :--- | :--- | :--- | :--- |
+| Presence and avatar stack (multi-tab aware) | Presence | `@collab_users`, `<.avatar_stack>` | none |
+| Away / idle status | Presence | `<.status_reporter>`, `status` in `@collab_users` | `LiveCollabStatus` |
+| Advisory field locks with tie-breaking | Presence | `@collab_locks`, `collab_attrs/4`, `<.field_indicator>`, `validate_not_locked/5` | `LiveCollabField` |
+| "Ask to edit" lock handoff | PubSub | `@collab_lock_asks`, `@collab_lock_requests`, `<.field_indicator asks=…>`, `<.lock_requests>` | `LiveCollabField` |
+| Conflict-aware forms | PubSub | `broadcast_changes/3`, `@collab_remote_changes`, `<.field_change_notice>` | `LiveCollabField` |
+| Row and element activity (viewing / selected / editing) | Presence | `@collab_activities`, `collab_row_attrs/4`, `<.row_indicator>`, `<.element_activity>` | `LiveCollabElement` |
+| Live cursors | PubSub | `<.cursor_layer>` | `LiveCollabCursor` |
+| Presenter mode and scroll following | PubSub | `<.viewport_container>`, `<.follow_pill>` | `LiveCollabViewport` |
+| Shared selection boxes | PubSub | `<.selection_layer>` | `LiveCollabSelection` |
+| Observability | `:telemetry` | `LiveCollab.Telemetry` | none |
 
-### Version 0.3.0 (Viewport Following & Multiplayer Selection Containers)
-- **Viewport & Scroll Following**: Presenters can lead followers through documents, canvases, or dashboards with smooth, programmatic scroll synchronization.
-- **Normalized Scroll Coordinates `[0.0, 1.0]`**: Eliminates coordinate distortion across differing display dimensions, aspect ratios, and responsive text layouts.
-- **Infinite Loop Feedback Suppression**: Programmatic follower scrolling suppresses local scroll event broadcasts, preventing cascading feedback loops.
-- **Follower Manual Breakout**: If a follower manually scrolls or wheels, follow mode gracefully disengages without fighting the user.
-- **Multiplayer Selection Containers (`<LiveCollab.Components.selection_layer />`)**: Real-time bounding boxes and marquee selections rendered in each collaborator's deterministic color with a floating username badge.
+Two transport paths:
 
-### Version 0.2.0 (High-Performance Collaborative Cursors)
-- **Zero Assigns Diffing**: High-frequency cursor messages bypass LiveView's assign diffing engine entirely via direct `push_event/3` dispatch. Zero template re-renders and zero Morphdom DOM overhead.
-- **Normalized Container Coordinates `[0.0, 1.0]`**: Cursor coordinates are transmitted relative to target containers, guaranteeing precise visual alignment across differing monitor sizes, responsive layouts, and zoom levels.
-- **Client-Side Throttling & Distance Deadband**: Limits transmission to 30ms (~33 fps) and skips broadcasts when mouse movement is below threshold, keeping network traffic minimal.
-- **Hardware-Accelerated 60/120 FPS Interpolation**: Uses `requestAnimationFrame` and linear interpolation (`lerp`) on the browser for butter-smooth cursor motion.
-- **Crisp SVG Pointers & Name Pills**: Renders Figma-style SVG cursors colored with each user's deterministic palette color and displaying their name tag.
-- **Inactivity Timeout & Leave Cleanup**: Cursors automatically fade out after 4 seconds of inactivity and clear immediately when the pointer leaves the container.
+* **Durable state** (who is here, locks, activity) lives in Presence metadata. It
+  is replicated across the cluster, rebuilt into assigns and rendered by HEEx.
+* **Ephemeral events** (cursors, scroll, selections) are relayed over PubSub and
+  pushed straight to the hooks with `push_event/3`. They never touch assigns, so
+  they never cause a re-render. A test verifies this on both sender and receivers.
 
-### Version 0.1.0 (Presence & Field-Level Collaboration)
-- **Collaborative Presence Tracking**: Clean, single-line API (`LiveCollab.track/3`) for tracking users viewing the same resource.
-- **Multi-Tab Isolation**: Transparently handles multiple tabs from the same user without identity or lock collisions via isolated client UUIDs.
-- **Avatar Stack Component (`<LiveCollab.Components.avatar_stack />`)**: Accessible, customizable avatar stack with deterministic colors, initial fallbacks, and overflow counters (`+3`).
-- **Field-Level Collaboration & Advisory Locking**:
-  - Automatically associates focused inputs with the active user.
-  - Broadcasts visual editing indicators to other collaborators.
-  - Optional client-side readonly locking and accessible `aria-readonly` attributes.
-  - **Deterministic Conflict Resolution (CRDT Tie-Breaking)**: Resolves race conditions and network split-brain collisions consistently across all cluster nodes without central coordination.
-  - **No Zombie Locks**: Process monitoring ensures locks are immediately released on tab close, navigation, or server crashes.
-  - **Server-Side Changeset Protection**: `LiveCollab.Field.validate_not_locked/5` prevents unauthorized form submissions even if client HTML attributes are tampered with.
+## What it guarantees
 
----
+Field locks are **advisory**. All nodes agree on the lock holder once Presence has
+converged, but two clients can briefly both hold a lock, for example during a
+network partition. Use locks to avoid accidental overwrites and to show who is
+editing. Enforce on submit with `validate_not_locked/5`, and use optimistic
+locking for data that must never be lost. Cursor, scroll and selection events are
+best effort. The details are in [Consistency guarantees](guides/guarantees.md).
 
 ## Installation
 
-Add `live_collab` to your list of dependencies in `mix.exs`:
-
 ```elixir
+# mix.exs
 def deps do
   [
-    {:live_collab, "~> 0.4.0"}
+    {:live_collab, "~> 0.5.0"}
   ]
 end
 ```
 
-Then run:
-
-```bash
-mix deps.get
-```
-
----
-
-## Configuration
-
-In `config/config.exs`:
+Requirements: Elixir 1.15+, Phoenix 1.7+, Phoenix LiveView 1.0+ (see
+[Compatibility](#compatibility)).
 
 ```elixir
+# config/config.exs
 config :live_collab,
-  presence: MyAppWeb.Presence,
-  pubsub: MyApp.PubSub,
-  topic_prefix: "live_collab",
-  max_field_id_length: 255,
-  telemetry_rate_per_sec: 50,
-  telemetry_burst_limit: 60,
-  clock_skew_tolerance_ms: 500
+  presence: MyAppWeb.Presence   # your `use Phoenix.Presence` module
 ```
 
----
-
-## Client JavaScript Setup
-
-In your `assets/js/app.js`:
-
 ```javascript
-import { LiveSocket } from "phoenix_live_view"
-import { Socket } from "phoenix"
+// assets/js/app.js
 import { LiveCollabHooks } from "live_collab"
 
 let liveSocket = new LiveSocket("/live", Socket, {
   params: { _csrf_token: csrfToken },
   hooks: { ...LiveCollabHooks }
 })
-
-liveSocket.connect()
 ```
 
----
+The hooks are plain ES modules with no build step and no runtime dependencies.
+Phoenix's default esbuild setup resolves `live_collab` from `deps/` through
+`NODE_PATH`.
 
-## Usage Guide
-
-### 1. Viewport & Scroll Following (Presentation Mode)
-
-Wrap long documents or dashboards with `<.viewport_container>` and display a `<.follow_pill>`:
-
-```heex
-<%!-- Follow pill showing the presenter with a toggle button --%>
-<%= if @presenter do %>
-  <LiveCollab.Components.follow_pill
-    leader_name={@presenter.name}
-    leader_client_id={@presenter.client_id}
-    leader_color={@presenter.color}
-    is_following={@is_following}
-  />
-<% end %>
-
-<%!-- Synchronized scroll viewport container --%>
-<LiveCollab.Components.viewport_container
-  container_id="doc_reader"
-  presenter={@is_presenter}
-  following={if @is_following, do: @presenter.client_id, else: nil}
-  class="overflow-y-auto h-[600px] border rounded-lg p-6 bg-white"
->
-  <div class="prose max-w-none">
-    <h1>Collaborative Document</h1>
-    <p>Scroll down to see followers match your position smoothly...</p>
-    <div style="height: 2000px;"></div>
-  </div>
-</LiveCollab.Components.viewport_container>
-```
-
-> [!TIP]
-> If a follower manually scrolls with their mouse wheel, `LiveCollabViewport` automatically disengages follow mode without fighting the user or echoing scroll events back to the presenter.
-
----
-
-### 2. Multiplayer Selection Containers
-
-Display real-time bounding boxes when collaborators select items or drag marquee rects:
-
-```heex
-<LiveCollab.Components.selection_layer
-  container_id="design_board"
-  class="w-full h-[500px] border rounded-lg bg-gray-50"
->
-  <div class="p-6 grid grid-cols-3 gap-4">
-    <div class="p-4 bg-white shadow rounded">Card 1</div>
-    <div class="p-4 bg-white shadow rounded">Card 2</div>
-    <div class="p-4 bg-white shadow rounded">Card 3</div>
-  </div>
-</LiveCollab.Components.selection_layer>
-```
-
----
-
-### 3. Collaborative Cursors (Zero Diff Overhead)
-
-```heex
-<LiveCollab.Components.cursor_layer
-  container_id="project_canvas"
-  class="w-full h-[600px] border border-gray-200 rounded-lg shadow-sm bg-white overflow-hidden"
->
-  <div class="p-8">
-    <h2 class="text-xl font-bold">Collaborative Canvas</h2>
-    <p class="text-gray-600">Move your cursor to see multiplayer pointers in real-time!</p>
-  </div>
-</LiveCollab.Components.cursor_layer>
-```
-
----
-
-### 4. Collaborative Presence & Avatar Stack
+## Quick start
 
 ```elixir
-defmodule MyAppWeb.OrderLive.Edit do
+defmodule MyAppWeb.OrderLive do
   use MyAppWeb, :live_view
+  import LiveCollab.Components
 
   def mount(%{"id" => id}, _session, socket) do
-    order = Orders.get_order!(id)
-    current_user = socket.assigns.current_user
+    order = Orders.get_order!(socket.assigns.current_user, id)   # authorize first
 
-    socket =
-      socket
-      |> assign(:order, order)
-      # Automatically initializes @collab_users, @collab_locks, and @collab_activities:
-      |> LiveCollab.track("order:#{id}", current_user)
-
-    {:ok, socket}
+    {:ok,
+     socket
+     |> assign(:order, order)
+     |> LiveCollab.track("order:#{id}", socket.assigns.current_user)}
   end
 end
 ```
 
-In your HEEx template:
+`user` is any map with `:id` and `:name`, and optionally `:avatar_url` and
+`:color`. Atom or string keys both work. `track/4` sets `@collab_users`,
+`@collab_locks`, `@collab_activities`, `@collab_client_id` and related assigns,
+and handles every `live_collab:*` event for you. Your own `handle_event/3` and
+`handle_info/2` keep working unchanged.
 
 ```heex
-<LiveCollab.Components.avatar_stack
-  users={@collab_users}
-  max={4}
-  size="md"
+<.avatar_stack users={@collab_users} max={4} />
+
+<input
+  type="text"
+  name="order[customer_name]"
+  value={@order.customer_name}
+  {collab_attrs("order.customer_name", @collab_locks, @collab_client_id)}
+/>
+<.field_indicator field="order.customer_name" locks={@collab_locks} current_client_id={@collab_client_id} />
+```
+
+## Usage
+
+### Away / idle status
+
+```heex
+<.status_reporter idle_after={60_000} />
+<.avatar_stack users={@collab_users} />
+```
+
+A tab is `:away` while its page is hidden or after `idle_after` ms without
+pointer, keyboard or scroll activity, and `:active` again on the next
+interaction. Each user in `@collab_users` has `status: :active | :away`, and a
+user counts as away only if all of their tabs are. `<.avatar_stack>` dims away
+users (CSS class `live-collab-away`).
+
+### Field locks and server-side enforcement
+
+`collab_attrs/4` attaches the `LiveCollabField` hook and marks the input
+`readonly` while someone else holds it. Focusing a held field is refused at
+once. If a concurrent claim wins the tie-break, the hook receives
+`live_collab:lock_lost`, blurs the input and dispatches a bubbling
+`live_collab:conflict` DOM event you can use for a toast.
+
+```elixir
+def handle_event("save", %{"order" => params}, socket) do
+  changeset =
+    socket.assigns.order
+    |> Order.changeset(params)
+    |> LiveCollab.validate_not_locked(:customer_name, socket.assigns.collab_locks, socket.assigns.collab_client_id)
+
+  # ...
+end
+```
+
+### "Ask to edit"
+
+```heex
+<.lock_requests requests={@collab_lock_requests} />
+
+<input type="text" name="order[name]" {collab_attrs("order.name", @collab_locks, @collab_client_id)} />
+<.field_indicator field="order.name" locks={@collab_locks} current_client_id={@collab_client_id} asks={@collab_lock_asks} />
+```
+
+When someone else holds the field, the indicator shows **Ask to edit**. The
+holder sees "Bob wants to edit order.name — **Hand over** / **Keep editing**".
+Handing over releases the holder's lock and focuses the requester's input,
+which claims it. A handoff can only answer a request that was actually received,
+and requests are dropped when either person leaves or the lock changes hands.
+
+### Conflict-aware forms
+
+After saving, announce the new values:
+
+```elixir
+def handle_event("save", %{"order" => params}, socket) do
+  {:ok, order} = Orders.update(socket.assigns.order, params)
+
+  {:noreply,
+   socket
+   |> assign(:order, order)
+   |> LiveCollab.broadcast_changes(%{"order.name" => order.name})}
+end
+```
+
+In every other open form:
+
+* inputs nobody is editing update and briefly highlight (`collab-remote-updated`);
+* if the receiver is editing that field, their text is left alone and
+  `<.field_change_notice field="order.name" changes={@collab_remote_changes} />`
+  shows "Alice saved “Acme” while you were editing — **Use theirs** / **Keep mine**".
+
+Track with `notify_changes: true` to receive
+`{:live_collab, :remote_changes, %{changes: changes, by: by}}` in `handle_info/2`
+and reload your data, so the new values survive later re-renders. LiveCollab
+never stores data; it only tells the other LiveViews what you saved.
+
+### Row and element activity
+
+```heex
+<tr
+  :for={item <- @items}
+  {collab_row_attrs("item:#{item.id}", @collab_activities, @collab_client_id, hover_intent: 300)}
+>
+  <td>
+    <.row_indicator element={"item:#{item.id}"} activities={@collab_activities} current_client_id={@collab_client_id} />
+    {item.name}
+  </td>
+</tr>
+```
+
+A click marks a row `selected`, keyboard focus marks it `viewing`, and editing a
+field inside it shows `editing`. `hover_intent` (in milliseconds) debounces
+mouse travel, so sweeping across a table does not write to Presence for every row.
+
+### Cursors
+
+```heex
+<.cursor_layer container_id="canvas" class="h-[600px] border rounded">
+  ...
+</.cursor_layer>
+```
+
+Coordinates are normalized to the container (`0.0..1.0`), so cursors line up
+across screen sizes. Sending is throttled (30 ms by default) with a distance
+deadband. Rendering interpolates with `requestAnimationFrame` only while cursors
+are moving. Idle cursors fade out, and departed collaborators' cursors are
+removed immediately.
+
+### Presenter mode and scroll following
+
+```heex
+<.viewport_container container_id="doc" presenter={@collab_spotlight_leader == @collab_client_id} auto_follow class="h-screen overflow-y-auto">
+  ...
+</.viewport_container>
+
+<.follow_pill
+  :if={@collab_spotlight_leader}
+  leader_name="Presenter"
+  leader_client_id={@collab_spotlight_leader}
+  is_following={@following?}
 />
 ```
 
----
+Start and stop presenting with `<button phx-click="live_collab:spotlight_lead">`
+and `phx-click="live_collab:spotlight_stop"`; LiveCollab handles and authorizes
+both. With `auto_follow`, everyone else follows the presenter's scrolling, and
+scrolling manually breaks out of follow mode. Presenting is allowed by default and denied for users with
+`role: "viewer"` / `"observer"`, `can_present?: false`, or when you assign
+`collab_can_present?: false`. Only the current presenter, or a user who may
+present, can stop a presentation.
 
-### 5. Table-Row Activity Indicators
+Clients that join after a presentation started are not told about it until the
+presenter's next status change (see [Limitations](#limitations)).
 
-```heex
-<table class="min-w-full divide-y divide-gray-200">
-  <tbody class="divide-y divide-gray-200">
-    <tr
-      :for={item <- @order.items}
-      class="transition-colors hover:bg-gray-50 data-[collab-active=true]:border-l-4"
-      {LiveCollab.Components.collab_row_attrs("item:#{item.id}", @collab_activities, @collab_client_id, hover_intent: 300)}
-    >
-      <td class="px-4 py-3 flex items-center gap-2">
-        <LiveCollab.Components.row_indicator
-          element={"item:#{item.id}"}
-          activities={@collab_activities}
-          current_client_id={@collab_client_id}
-        />
-        <span><%= item.name %></span>
-      </td>
-      <td class="px-4 py-3 text-right"><%= item.quantity %></td>
-    </tr>
-  </tbody>
-</table>
-```
-
----
-
-### 6. Collaborative Form Inputs & Advisory Locks
+### Shared selections
 
 ```heex
-<div class="space-y-1">
-  <div class="flex items-center justify-between">
-    <label class="block text-sm font-medium text-gray-700">Customer Name</label>
-    <.field_indicator
-      field="order.customer_name"
-      locks={@collab_locks}
-      current_client_id={@collab_client_id}
-    />
-  </div>
-
-  <input
-    type="text"
-    name="order[customer_name]"
-    value={@order.customer_name}
-    class="w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
-    {LiveCollab.Components.collab_attrs("order.customer_name", @collab_locks, @collab_client_id)}
-  />
-</div>
+<.selection_layer container_id="board" class="relative h-[500px]">...</.selection_layer>
 ```
 
----
+`<.cursor_layer>` and `<.selection_layer>` render the overlay their hook draws
+into, marked `phx-update="ignore"` so LiveView re-renders don't remove it. If you
+attach a hook to your own element with `collab_cursor_attrs/2` or
+`collab_selection_attrs/2`, add `<LiveCollab.Components.overlay id="..." />`
+inside it.
 
-### 7. Server-Side Changeset Enforcement (Security)
+Report the local selection from your own code (normalized coordinates):
 
-Prevent unauthorized submissions by checking locks inside `phx-change` or `phx-submit`:
+```javascript
+board.dispatchEvent(new CustomEvent("live_collab:local_selection", {
+  bubbles: true,
+  detail: { x: 0.1, y: 0.2, width: 0.3, height: 0.1, selected_ids: ["card-1", "card-2"] }
+}))
+board.dispatchEvent(new CustomEvent("live_collab:local_selection_clear", { bubbles: true }))
+```
+
+## Configuration
+
+| Key | Default | Description |
+| :--- | :--- | :--- |
+| `:presence` | required | Your `Phoenix.Presence` module |
+| `:pubsub` | Presence's `:pubsub_server` | `Phoenix.PubSub` server |
+| `:topic_prefix` | `"live_collab"` | Prefix for collaboration topics |
+| `:max_field_id_length` | `255` | Max bytes for field, element and container ids (max 4096) |
+| `:telemetry_rate_per_sec` / `:telemetry_burst_limit` | `50` / `60` | Token bucket for cursor, viewport, selection and spotlight events |
+| `:presence_rate_per_sec` / `:presence_burst_limit` | `20` / `40` | Token bucket for events that write to Presence (focus, activity) |
+| `:presence_sync_interval_ms` | `50` | Minimum time between collaboration-state rebuilds per LiveView |
+| `:clock_skew_tolerance_ms` | `500` | Window within which lock claims are ordered by client id |
+
+Every key can also be passed per call: `LiveCollab.track(socket, resource, user, presence_rate_per_sec: 5)`.
+Invalid values raise `ArgumentError`.
+
+## Observability
 
 ```elixir
-def handle_event("save", %{"order" => order_params}, socket) do
-  changeset =
-    socket.assigns.order
-    |> Order.changeset(order_params)
-    |> LiveCollab.validate_not_locked(
-      :customer_name,
-      socket.assigns.collab_locks,
-      socket.assigns.collab_client_id
-    )
-
-  if changeset.valid? do
-    {:noreply, socket}
-  else
-    {:noreply, assign(socket, :form, to_form(changeset))}
-  end
-end
+LiveCollab.Telemetry.attach_default_logger()
 ```
 
----
+LiveCollab emits `:telemetry` events for sessions, presence rebuilds (duration,
+room size, coalesced diffs), lock claims, denials and losses, rate-limited and
+rejected client events, and unauthorized presenter attempts. See the
+[telemetry guide](guides/telemetry.md) for LiveDashboard metrics.
 
-### 8. Spotlight & Presentation Permissions
+For a runnable demo with a live diagnostics panel:
 
-By default, any tracked user can lead a presentation. In environments with role-based access control, restrict viewer or observer attendees:
-
-```elixir
-# Option A: Assign permission flag on socket
-socket = assign(socket, :collab_can_present?, false)
-
-# Option B: Pass role in user map
-LiveCollab.track(socket, "doc:123", %{id: user.id, name: user.name, role: "viewer"})
+```bash
+elixir examples/collab_demo.exs   # then open http://localhost:4000/?name=Alice in two windows
 ```
 
-If an unauthorized attendee fires `"live_collab:spotlight_lead"`, the server rejects the request, pushes `"live_collab:spotlight_unauthorized"` back to the client, and drops the broadcast. Furthermore, only the active leader or an authorized presenter/admin can emit `"live_collab:spotlight_stop"` to terminate an ongoing presentation.
+## Security
 
----
+All client input is treated as untrusted. Ids are validated against a strict
+character set and size, coordinates must be finite and in range, and selection
+lists are bounded. Colors must be hex, and avatar URLs must be `http(s)`,
+root-relative or `data:image`. Identity always comes from the server.
 
-## Adversarial Design & Failure Mitigations
+Each LiveView has two token buckets. The hooks never use `innerHTML` with
+collaborator data.
 
-1. **Path 2 Zero-Diffing Boundary & Mailbox Protection**:
-   High-frequency telemetry (cursors, viewports, selections) travels strictly over `Phoenix.PubSub` directly to client JS hooks via `push_event/3`. `socket.assigns` is **never** mutated during telemetry, eliminating HEEx template re-render storms and DOM reconciliation.
-2. **Token Bucket Rate Limiting (`LiveCollab.RateLimiter`)**:
-   Purely functional in-memory token buckets in socket assigns ($O(1)$ monotonic arithmetic) protect the LiveView mailbox and cluster PubSub against flood attacks from malicious or unthrottled clients. Telemetry exceeding configured rate limits is dropped at the socket boundary.
-3. **Multi-Node Cluster Clock-Skew Hardening**:
-   Replaces fragile raw millisecond ordering with windowed bucketing (`clock_skew_tolerance_ms: 500`). Competing focus claims arriving within the concurrency window break ties deterministically on `{bucket, client_id, user_id}`, rendering tie-breaking immune to NTP drift between cluster nodes.
-4. **Untrusted Client ID Parameter Injection Immunity**:
-   Wire-level `params["client_id"]` payloads are completely ignored across all event handlers. The server strictly uses `sock.assigns[:collab_client_id]`, preventing identity spoofing, lock theft, or tie-break rigging.
-5. **Presence Untrack Key Parity & No Zombie Locks**:
-   `Presence.untrack` is guaranteed to target the tracked `user_key` rather than the tab `client_id`, cleanly purging presence state upon departure. Process monitors purge locks immediately if a tab or node crashes.
-6. **Lock Seniority Preservation**:
-   Re-focusing an existing field preserves the original `acquired_at` timestamp in `Phoenix.Presence`, preventing lock seniority flapping during form re-renders.
-7. **Infinite Scroll Feedback Defense**:
-   When programmatic scrolling is applied to follow a leader, an internal guard suppresses local scroll broadcasts, eliminating infinite feedback ping-pong loops.
-8. **Multi-Tab Isolation**:
-   Browser tabs generate isolated `client_id`s in `sessionStorage`. If the same user has two tabs open, Tab 2 is locked out if Tab 1 holds the field, preventing self-overwrites.
-9. **Malicious Input Defense & Bounded Payloads**:
-   All field, element, coordinate, scroll, and selection parameters are strictly validated and bounded (preventing NaN, infinite coordinates, XSS, and payload bombing with max 100 selection items and 255 bytes per ID).
+**LiveCollab does not authorize access to your resources.** Check access before
+calling `track/4`. Read the full [security model](guides/security.md) and report
+vulnerabilities as described in [SECURITY.md](https://github.com/HataluliRandima/live_collab/blob/main/SECURITY.md).
 
----
+## Performance
+
+Measured on one node (WSL2, 7 GiB RAM, Elixir 1.17.0 / OTP 26.1) with real LiveView
+processes, `Phoenix.Presence` and `Phoenix.PubSub`. N LiveViews join one room
+one after another, then one of them sends 50 cursor moves. The harness is
+`test/bench/room_bench_test.exs`; "before" is 0.4.0 with only the pid fix needed
+to run at all.
+
+| N | Version | Join storm converged | Join reductions | Cursor fan-out (50 moves → N−1 clients) | LiveView memory (after GC) |
+| ---: | :--- | ---: | ---: | ---: | ---: |
+| 10 | before | 1.8 s | 0.15 M | 509 ms¹ | 21 KB / client |
+| 10 | 0.5.0 | 0.36 s | 0.09 M | 36 ms | 23 KB / client |
+| 100 | before | 17.4 s | 81.7 M | 418 ms | 140 KB / client |
+| 100 | 0.5.0 | 2.3 s | 52.1 M | 115 ms | 140 KB / client |
+| 500 | before | 464 s | 12.8 B | 942 ms | 364 KB / client |
+| 500 | 0.5.0 | 218 s | 8.3 B | 827 ms | 588 KB / client |
+| 1000 | both | not measured² | | | |
+
+¹ First measurement of the run; includes warm-up. Treat small-N fan-out figures as noisy.
+² The 0.5.0 run was stopped after 21 minutes at 5.7 GB RSS on this 7 GiB machine,
+before converging. The "before" run was not attempted; extrapolating from N=500, it
+would take over an hour. 1000-collaborator rooms are not supported by this
+measurement.
+
+Reductions are BEAM work units (a CPU proxy) summed over all LiveView processes.
+Times are single runs of a sequential join storm. Real users join gradually,
+so steady-state cost per Presence change matters more than these totals.
+
+What changed: each LiveView applies `presence_diff` payloads to a local replica
+instead of calling `Presence.list/1` on every change. `list/1` is a
+`GenServer.call` into a Tracker shard that copies the shard's state, so hundreds
+of LiveViews listing at once serialized on one process. Rebuilds are throttled
+per LiveView. The cost is memory: each LiveView now holds its replica, which is
+about 60% more per client at N=500.
+
+How cost scales:
+
+* **Each Presence change** (join, leave, focus) makes every LiveView in the room
+  rebuild its derived state (users, locks, activities). That is O(N) per
+  LiveView and O(N²) per room. 0.5.0 coalesces and throttles these rebuilds
+  (`presence_sync_interval_ms`) but cannot remove the O(N) cost of a rebuild.
+* **Each cursor move** is delivered to N - 1 LiveViews and browsers. With
+  everyone moving at once, a room handles O(N²) messages per second. Rate limits
+  bound the per-client input, not the room total.
+* **Memory** per LiveView includes the full collaborator list, so room memory
+  grows roughly with N².
+
+In practice, rooms of tens of active collaborators are comfortable. For rooms of
+hundreds, measure with your own workload and consider disabling cursors or
+limiting room size.
+
+## Compatibility
+
+| | Tested |
+| :--- | :--- |
+| Elixir / OTP | 1.15.8 / 26, 1.17 / 26, 1.20.1 / 29 |
+| Phoenix | 1.8 |
+| Phoenix LiveView | 1.2 |
+| Browsers | Evergreen browsers (hooks are ES2015+ modules; JS tests run under jsdom, not real browsers) |
+
+Other versions allowed by the dependency requirements are expected to work but
+are not covered by the test matrix.
+
+## Limitations
+
+* Locks are advisory, and all cross-node guarantees are eventual (see
+  [guarantees](guides/guarantees.md)).
+* Presenter state is not persisted. Late joiners learn about a presentation only
+  from the next spotlight event.
+* One tracked resource per LiveView process.
+* Room size directly drives CPU and memory (see [Performance](#performance)).
+
+## Development
+
+```bash
+mix deps.get && npm ci
+mix test                                       # unit + LiveView integration tests
+epmd -daemon && mix test --only distributed    # multi-node tests (:peer)
+npm test                                       # JS hooks (node:test + jsdom)
+mix credo --strict && mix dialyzer
+```
+
+See [CONTRIBUTING.md](https://github.com/HataluliRandima/live_collab/blob/main/CONTRIBUTING.md).
 
 ## License
 
-MIT © LiveCollab Contributors
+MIT. See [LICENSE](https://github.com/HataluliRandima/live_collab/blob/main/LICENSE).

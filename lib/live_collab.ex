@@ -14,11 +14,14 @@ defmodule LiveCollab do
 
   ### 1. Configure Presence in your application
 
-  In `config/config.exs`:
+  In `config/config.exs` (`:pubsub` is optional; it defaults to the Presence
+  module's `:pubsub_server`):
 
       config :live_collab,
         presence: MyAppWeb.Presence,
         pubsub: MyApp.PubSub
+
+  See `LiveCollab.Config` for every option.
 
   ### 2. Track collaboration in your LiveView
 
@@ -80,6 +83,13 @@ defmodule LiveCollab do
         params: {_csrf_token: csrfToken},
         hooks: { ...LiveCollabHooks }
       })
+
+  ## Further reading
+
+    * `LiveCollab.LiveView` - lifecycle, assigns and the event protocol
+    * `LiveCollab.Telemetry` - events for monitoring rooms, locks and abuse
+    * The *Consistency guarantees* and *Security model* guides - what is (and
+      is not) guaranteed across a cluster, and the threat model
   """
 
   alias LiveCollab.Element
@@ -98,6 +108,12 @@ defmodule LiveCollab do
   Untracks collaboration and unsubscribes from the collaboration topic.
   """
   defdelegate untrack(socket, opts \\ []), to: LV
+
+  @doc """
+  Announces saved field values to the other collaborators. See
+  `LiveCollab.LiveView.broadcast_changes/3`.
+  """
+  defdelegate broadcast_changes(socket, changes, opts \\ []), to: LV
 
   @doc """
   Checks if a field is currently locked.

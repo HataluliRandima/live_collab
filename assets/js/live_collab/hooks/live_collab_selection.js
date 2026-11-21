@@ -1,127 +1,191 @@
 /**
  * LiveCollab - Multiplayer Selection Containers Hook
  *
- * Renders real-time collaborative selection bounding boxes and marquee rectangles.
+ * Renders collaborators' selection boxes (normalized [0.0, 1.0] coordinates) in
+ * their color with a name tag, and forwards *your* selection to the server.
  *
- * Capabilities:
- * - Normalized coordinate bounding box mapping [0.0, 1.0]
- * - Visual collaborator indicators: border & translucent fill in user's color + username tag
- * - Automatic fadeout and leave cleanup
- * - Zero LiveView assigns diffing
+ * Reporting the local selection: dispatch a DOM event on (or inside) the
+ * container from your own selection logic:
+ *
+ *     container.dispatchEvent(new CustomEvent("live_collab:local_selection", {
+ *       bubbles: true,
+ *       detail: { x: 0.1, y: 0.2, width: 0.3, height: 0.1, selected_ids: ["card-1"] }
+ *     }))
+ *
+ *     container.dispatchEvent(new CustomEvent("live_collab:local_selection_clear", { bubbles: true }))
+ *
+ * Reports are throttled (`data-collab-throttle`, default 50ms; the latest
+ * selection is always delivered). Remote boxes fade after inactivity, are removed
+ * from the DOM shortly after, and immediately when the collaborator leaves.
+ *
+ * Security: names are written with textContent and colors must be #rrggbb.
  */
 
-function getTabClientId() {
-  const KEY = "live_collab_tab_id";
-  try {
-    let id = window.sessionStorage.getItem(KEY);
-    if (!id) {
-      id = typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-      window.sessionStorage.setItem(KEY, id);
-    }
-    return id;
-  } catch (_e) {
-    return "tab_" + Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
-  }
-}
+import {
+  adoptLayer,
+  departedClientIds,
+  ensureLayerAttached,
+  finite,
+  matchesContainer,
+  safeColor,
+  safeName,
+  safePush
+} from "../utils.js";
 
 export const LiveCollabSelection = {
   mounted() {
-    this.clientId = getTabClientId();
     this.containerId = this.el.dataset.collabContainer || "default";
+    this.throttleMs = parseInt(this.el.dataset.collabThrottle, 10) || 50;
+    this.fadeMs = parseInt(this.el.dataset.collabFadeMs, 10) || 5000;
+    this.removeMs = this.fadeMs + 1000;
     this.remoteSelections = new Map();
+    this.lastSentAt = 0;
+    this.pendingSelection = null;
+    this.trailingTimer = null;
 
-    // Ensure relative positioning
-    const computed = window.getComputedStyle(this.el);
-    if (computed.position === "static") {
+    if (window.getComputedStyle(this.el).position === "static") {
       this.el.style.position = "relative";
     }
 
-    // Selection overlay layer
-    this.selectionLayer = document.createElement("div");
-    this.selectionLayer.className = "live-collab-selection-layer pointer-events-none absolute inset-0 overflow-hidden z-40 select-none";
-    this.el.appendChild(this.selectionLayer);
+    const { layer, owned } = adoptLayer(this.el, "live-collab-selection-layer z-40");
+    this.selectionLayer = layer;
+    this.ownsLayer = owned;
 
-    this.handleSelectionMoved = this.handleSelectionMoved.bind(this);
-    this.handleSelectionCleared = this.handleSelectionCleared.bind(this);
+    this.handleLocalSelection = this.handleLocalSelection.bind(this);
+    this.handleLocalClear = this.handleLocalClear.bind(this);
+    this.el.addEventListener("live_collab:local_selection", this.handleLocalSelection);
+    this.el.addEventListener("live_collab:local_selection_clear", this.handleLocalClear);
 
-    this.handleEvent("live_collab:selection_moved", this.handleSelectionMoved);
-    this.handleEvent("live_collab:selection_cleared", this.handleSelectionCleared);
+    this.handleEvent("live_collab:selection_moved", (payload) => {
+      if (matchesContainer(payload, this.containerId)) this.updateRemoteSelection(payload);
+    });
+
+    this.handleEvent("live_collab:selection_cleared", (payload) => {
+      if (matchesContainer(payload, this.containerId)) this.removeRemoteSelection(payload.client_id);
+    });
+
+    this.handleEvent("live_collab:peers_left", (payload) => {
+      departedClientIds(payload).forEach((id) => this.removeRemoteSelection(id));
+    });
+  },
+
+  updated() {
+    if (this.ownsLayer) ensureLayerAttached(this.el, this.selectionLayer);
   },
 
   destroyed() {
-    this.remoteSelections.forEach((item) => {
-      if (item.fadeTimer) clearTimeout(item.fadeTimer);
-      if (item.el && item.el.parentNode) item.el.remove();
-    });
-    this.remoteSelections.clear();
+    clearTimeout(this.trailingTimer);
+    this.el.removeEventListener("live_collab:local_selection", this.handleLocalSelection);
+    this.el.removeEventListener("live_collab:local_selection_clear", this.handleLocalClear);
+    this.remoteSelections.forEach((_item, clientId) => this.removeRemoteSelection(clientId));
+    if (this.ownsLayer && this.selectionLayer) this.selectionLayer.remove();
+  },
 
-    if (this.selectionLayer && this.selectionLayer.parentNode) {
-      this.selectionLayer.remove();
+  // --- local selection -> server ------------------------------------------------
+
+  handleLocalSelection(event) {
+    const d = (event && event.detail) || {};
+    const box = [finite(d.x), finite(d.y), finite(d.width), finite(d.height)];
+    if (box.includes(null)) return;
+
+    this.pendingSelection = {
+      x: box[0],
+      y: box[1],
+      width: box[2],
+      height: box[3],
+      selected_ids: Array.isArray(d.selected_ids) ? d.selected_ids.slice(0, 100) : [],
+      container_id: this.containerId
+    };
+    this.flushSelection();
+  },
+
+  flushSelection() {
+    const wait = this.throttleMs - (performance.now() - this.lastSentAt);
+
+    if (wait <= 0) {
+      clearTimeout(this.trailingTimer);
+      this.trailingTimer = null;
+      this.lastSentAt = performance.now();
+      const payload = this.pendingSelection;
+      this.pendingSelection = null;
+      if (payload) safePush(this, "live_collab:selection_move", payload);
+    } else if (!this.trailingTimer) {
+      // Trailing edge: the final selection of a drag is never dropped.
+      this.trailingTimer = setTimeout(() => {
+        this.trailingTimer = null;
+        this.flushSelection();
+      }, wait);
     }
   },
 
-  handleSelectionMoved(payload) {
-    if (payload.client_id === this.clientId) return;
-    if (payload.container_id && payload.container_id !== this.containerId) return;
+  handleLocalClear(_event) {
+    clearTimeout(this.trailingTimer);
+    this.trailingTimer = null;
+    this.pendingSelection = null;
+    safePush(this, "live_collab:selection_clear", { container_id: this.containerId });
+  },
+
+  // --- remote selections ----------------------------------------------------------
+
+  updateRemoteSelection(payload) {
+    const clientId = payload && payload.client_id;
+    const box = [finite(payload.x), finite(payload.y), finite(payload.width), finite(payload.height)];
+    if (typeof clientId !== "string" || box.includes(null)) return;
 
     const rect = this.el.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
 
-    // Convert normalized coordinates to container pixels
-    const pxX = payload.x * rect.width;
-    const pxY = payload.y * rect.height;
-    const pxW = payload.width * rect.width;
-    const pxH = payload.height * rect.height;
-
-    let selection = this.remoteSelections.get(payload.client_id);
-    const color = payload.user_color || "#4F46E5";
-    const name = payload.user_name || "Collaborator";
+    let selection = this.remoteSelections.get(clientId);
 
     if (!selection) {
+      const color = safeColor(payload.user_color);
       const el = document.createElement("div");
-      el.className = "live-collab-selection-box absolute transition-all duration-75 pointer-events-none";
+      el.className = "live-collab-selection-box absolute top-0 left-0 transition-all duration-75 pointer-events-none";
       el.style.border = `2px solid ${color}`;
-      el.style.backgroundColor = `${color}1A`; // ~10-15% opacity hex
+      el.style.backgroundColor = `${color}1A`;
       el.style.borderRadius = "4px";
+      el.style.position = "absolute";
+      el.style.top = "0";
+      el.style.left = "0";
 
       const tag = document.createElement("div");
-      tag.className = "live-collab-selection-tag absolute -top-5 left-0 px-1.5 py-0.5 rounded text-[10px] font-bold text-white whitespace-nowrap shadow-sm";
+      tag.className =
+        "live-collab-selection-tag absolute -top-5 left-0 px-1.5 py-0.5 rounded text-[10px] font-bold text-white whitespace-nowrap shadow-sm";
       tag.style.backgroundColor = color;
-      tag.textContent = `${name}'s selection`;
+      tag.style.color = "#fff";
+      tag.style.position = "absolute";
+      tag.style.top = "-20px";
+      tag.style.left = "0";
+      tag.textContent = `${safeName(payload.user_name)}'s selection`;
 
       el.appendChild(tag);
       this.selectionLayer.appendChild(el);
-
-      selection = { el, fadeTimer: null };
-      this.remoteSelections.set(payload.client_id, selection);
+      selection = { el, fadeTimer: null, removeTimer: null };
+      this.remoteSelections.set(clientId, selection);
     }
 
-    // Update dimensions
-    selection.el.style.transform = `translate3d(${pxX}px, ${pxY}px, 0)`;
-    selection.el.style.width = `${pxW}px`;
-    selection.el.style.height = `${pxH}px`;
+    const [x, y, width, height] = box;
+    selection.el.style.transform = `translate3d(${x * rect.width}px, ${y * rect.height}px, 0)`;
+    selection.el.style.width = `${width * rect.width}px`;
+    selection.el.style.height = `${height * rect.height}px`;
     selection.el.style.opacity = "1";
 
-    // Auto-fade after 5 seconds of inactivity
-    if (selection.fadeTimer) clearTimeout(selection.fadeTimer);
+    clearTimeout(selection.fadeTimer);
+    clearTimeout(selection.removeTimer);
     selection.fadeTimer = setTimeout(() => {
-      if (selection.el) selection.el.style.opacity = "0";
-    }, 5000);
+      selection.el.style.opacity = "0";
+    }, this.fadeMs);
+    selection.removeTimer = setTimeout(() => this.removeRemoteSelection(clientId), this.removeMs);
   },
 
-  handleSelectionCleared(payload) {
-    if (payload.client_id === this.clientId) return;
-
-    const selection = this.remoteSelections.get(payload.client_id);
-    if (selection) {
-      if (selection.fadeTimer) clearTimeout(selection.fadeTimer);
-      if (selection.el) selection.el.remove();
-      this.remoteSelections.delete(payload.client_id);
-    }
+  removeRemoteSelection(clientId) {
+    const selection = this.remoteSelections.get(clientId);
+    if (!selection) return;
+    clearTimeout(selection.fadeTimer);
+    clearTimeout(selection.removeTimer);
+    selection.el.remove();
+    this.remoteSelections.delete(clientId);
   }
 };
 
 export default LiveCollabSelection;
-
