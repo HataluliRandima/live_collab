@@ -63,6 +63,22 @@ defmodule LiveCollab.Telemetry do
     * `[:live_collab, :spotlight, :unauthorized]` - extra metadata `:action`
       (`:lead` or `:stop`).
 
+  ## Lock handoff
+
+  Extra metadata: `:field`.
+
+    * `[:live_collab, :lock, :requested]` - this client asked the holder for a
+      field; extra metadata `:holder_client_id`.
+    * `[:live_collab, :lock, :handed_off]` / `[:live_collab, :lock, :handoff_declined]` -
+      the holder answered a request; extra metadata `:requester_client_id`.
+
+  ## Conflict-aware forms
+
+    * `[:live_collab, :field, :changes_broadcast]` - `broadcast_changes/3` was
+      called. Measurements: `%{count: fields}`. Extra metadata: `:fields`.
+    * `[:live_collab, :field, :conflict]` - a change arrived for a field this
+      client is editing; extra metadata `:field`, `:by_client_id`.
+
   ## Status
 
     * `[:live_collab, :status, :changed]` - a tab became `:active` or `:away`;
@@ -106,7 +122,12 @@ defmodule LiveCollab.Telemetry do
     [:spotlight, :started],
     [:spotlight, :stopped],
     [:spotlight, :unauthorized],
-    [:status, :changed]
+    [:status, :changed],
+    [:lock, :requested],
+    [:lock, :handed_off],
+    [:lock, :handoff_declined],
+    [:field, :changes_broadcast],
+    [:field, :conflict]
   ]
 
   @logger_handler_id "live-collab-default-logger"
@@ -174,6 +195,17 @@ defmodule LiveCollab.Telemetry do
   defp log_message([:lock, :lost], _m, meta) do
     {:info,
      "[LiveCollab] #{meta.client_id} lost lock on #{inspect(meta.field)} to #{meta.winner_client_id} on #{meta.topic}"}
+  end
+
+  defp log_message([:lock, action], _m, meta)
+       when action in [:requested, :handed_off, :handoff_declined] do
+    {:debug,
+     "[LiveCollab] lock #{action} on #{inspect(meta.field)} by #{meta.client_id} on #{meta.topic}"}
+  end
+
+  defp log_message([:field, :conflict], _m, meta) do
+    {:info,
+     "[LiveCollab] #{meta.client_id} was editing #{inspect(meta.field)} when #{meta.by_client_id} saved it on #{meta.topic}"}
   end
 
   defp log_message([:lock, action], _m, meta) when action in [:claimed, :released, :denied] do

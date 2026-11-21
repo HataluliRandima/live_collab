@@ -59,6 +59,14 @@ recommended. See `guides/guarantees.md` for what LiveCollab does and does not gu
 - Requires Elixir `~> 1.15` and `phoenix_live_view ~> 1.0`.
 
 ### Added
+- "Ask to edit" lock handoff: `<.field_indicator asks={@collab_lock_asks}>` asks
+  the holder, `<.lock_requests>` shows Hand over / Keep editing, and a handover
+  focuses the requester's input. Requests are validated, rate limited, and only
+  answerable by the holder who received them.
+- Conflict-aware forms: `LiveCollab.broadcast_changes/3` announces saved values;
+  idle inputs update and highlight, while a collaborator editing the field gets
+  `<.field_change_notice>` (Use theirs / Keep mine) instead of losing their text.
+  `notify_changes: true` delivers a message so the app can reload its data.
 - Away / idle status: `<.status_reporter>` and the `LiveCollabStatus` hook mark a
   tab away when hidden or idle; `@collab_users` carries `status`; avatars dim away
   users; `[:live_collab, :status, :changed]` telemetry.

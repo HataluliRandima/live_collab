@@ -44,6 +44,9 @@ counter("live_collab.spotlight.unauthorized.count", tags: [:action]),
 counter("live_collab.lock.claimed.count"),
 counter("live_collab.lock.denied.count"),
 counter("live_collab.lock.lost.count"),
+counter("live_collab.lock.requested.count"),
+counter("live_collab.lock.handed_off.count"),
+counter("live_collab.field.conflict.count"),
 
 # Room cost
 summary("live_collab.presence.sync.duration", unit: {:native, :millisecond}),

@@ -165,10 +165,19 @@ defmodule LiveCollab.Components do
         locks={@collab_locks}
         current_client_id={@collab_client_id}
       />
+
+  Pass `asks={@collab_lock_asks}` to add an **Ask to edit** button. It sends a
+  request to the current holder, who sees it in `lock_requests/1`; the button
+  then shows "Request sent" or "Declined" until the lock changes hands.
   """
   attr :field, :string, required: true, doc: "The field identifier"
   attr :locks, :map, required: true, doc: "The @collab_locks map"
   attr :current_client_id, :string, default: nil, doc: "The current tab client ID"
+
+  attr :asks, :map,
+    default: nil,
+    doc: "The @collab_lock_asks map; enables the Ask to edit button when given"
+
   attr :class, :string, default: nil
 
   def field_indicator(assigns) do
@@ -179,6 +188,7 @@ defmodule LiveCollab.Components do
       assigns
       |> assign(:lock, lock)
       |> assign(:is_other, is_other)
+      |> assign(:ask, assigns.asks && Map.get(assigns.asks, assigns.field))
 
     ~H"""
     <%= if @is_other do %>
@@ -193,9 +203,154 @@ defmodule LiveCollab.Components do
       >
         <span class="inline-block w-1.5 h-1.5 rounded-full bg-white animate-pulse"></span>
         <span class="truncate max-w-[140px]"><%= @lock.user_name %> is editing</span>
+        <button
+          :if={@asks && @ask != :pending}
+          type="button"
+          class="live-collab-ask-button ml-1 px-1.5 rounded bg-white/20 hover:bg-white/30"
+          phx-click="live_collab:lock_request"
+          phx-value-field={@field}
+        >
+          {if @ask == :declined, do: "Declined · ask again", else: "Ask to edit"}
+        </button>
+        <span :if={@ask == :pending} class="live-collab-ask-pending ml-1 opacity-80">
+          Request sent…
+        </span>
       </div>
     <% end %>
     """
+  end
+
+  @doc """
+  Renders pending "Ask to edit" requests for fields this client holds, with
+  **Hand over** and **Keep editing** buttons.
+
+  Handing over releases this client's lock and tells the requester's
+  `LiveCollabField` hook to focus the input, which claims it. Pass `field` to
+  render only the requests for one field (e.g. next to its input).
+
+  ## Examples
+
+      <.lock_requests requests={@collab_lock_requests} />
+      <.lock_requests requests={@collab_lock_requests} field="order.name" />
+  """
+  attr :requests, :map, required: true, doc: "The @collab_lock_requests map"
+  attr :field, :string, default: nil, doc: "Only show requests for this field"
+  attr :class, :string, default: nil
+
+  def lock_requests(assigns) do
+    entries =
+      for {field, reqs} <- assigns.requests,
+          is_nil(assigns.field) or field == assigns.field,
+          req <- reqs,
+          do: {field, req}
+
+    assigns = assign(assigns, :entries, entries)
+
+    ~H"""
+    <div
+      :for={{field, req} <- @entries}
+      role="alert"
+      class={["live-collab-lock-request inline-flex items-center gap-2 px-2 py-1 rounded text-xs", @class]}
+    >
+      <span
+        class="inline-block w-2 h-2 rounded-full"
+        style={"background-color: #{css_color(req.user_color, req.client_id)};"}
+      >
+      </span>
+      <span>{req.user_name} wants to edit <strong>{field}</strong></span>
+      <button
+        type="button"
+        phx-click="live_collab:lock_handoff"
+        phx-value-field={field}
+        phx-value-to={req.client_id}
+        phx-value-accept="true"
+      >
+        Hand over
+      </button>
+      <button
+        type="button"
+        phx-click="live_collab:lock_handoff"
+        phx-value-field={field}
+        phx-value-to={req.client_id}
+        phx-value-accept="false"
+      >
+        Keep editing
+      </button>
+    </div>
+    """
+  end
+
+  @doc """
+  Renders a conflict notice when another collaborator saved a field this client
+  was editing (see `LiveCollab.broadcast_changes/3`), with **Use theirs** and
+  **Keep mine** buttons.
+
+  "Use theirs" puts the saved value into the input (dispatching an `input`
+  event, so `phx-change` forms see it); "Keep mine" leaves the input alone.
+  Both dismiss the notice.
+
+  `input_id` defaults to the id `collab_attrs/4` generates for `field`; set it if
+  you passed your own `id` there.
+
+  ## Examples
+
+      <.field_change_notice field="order.name" changes={@collab_remote_changes} />
+  """
+  attr :field, :string, required: true
+  attr :changes, :map, required: true, doc: "The @collab_remote_changes map"
+  attr :input_id, :string, default: nil
+  attr :class, :string, default: nil
+
+  def field_change_notice(assigns) do
+    change = Map.get(assigns.changes, assigns.field)
+    input_id = assigns.input_id || field_dom_id(assigns.field)
+    dismiss = JS.push("live_collab:dismiss_change", value: %{field: assigns.field})
+
+    assigns =
+      assigns
+      |> assign(:change, change)
+      |> assign(:keep_mine, dismiss)
+      |> assign(
+        :use_theirs,
+        change &&
+          JS.dispatch("live_collab:apply_remote",
+            to: "#" <> input_id,
+            detail: %{value: change.value}
+          )
+          |> JS.push("live_collab:dismiss_change", value: %{field: assigns.field})
+      )
+
+    ~H"""
+    <div
+      :if={@change}
+      role="alert"
+      class={["live-collab-change-notice inline-flex items-center gap-2 px-2 py-1 rounded text-xs", @class]}
+    >
+      <span
+        class="inline-block w-2 h-2 rounded-full"
+        style={"background-color: #{css_color(@change.by_color, @change.by_client_id)};"}
+      >
+      </span>
+      <span>
+        {@change.by_name} saved “{display_value(@change.value)}” while you were editing.
+      </span>
+      <button type="button" phx-click={@use_theirs}>Use theirs</button>
+      <button type="button" phx-click={@keep_mine}>Keep mine</button>
+    </div>
+    """
+  end
+
+  @doc """
+  The DOM id `collab_attrs/4` generates for `field` (when no `:id` is given).
+  """
+  @spec field_dom_id(String.t()) :: String.t()
+  def field_dom_id(field), do: hook_dom_id("live-collab-field", field)
+
+  defp display_value(nil), do: ""
+
+  defp display_value(value) do
+    text = to_string(value)
+    if String.length(text) > 80, do: String.slice(text, 0, 79) <> "…", else: text
   end
 
   @doc """

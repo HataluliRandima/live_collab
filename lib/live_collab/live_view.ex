@@ -116,6 +116,7 @@ defmodule LiveCollab.LiveView do
       :presence_limiter,
       active_type: nil,
       status: :active,
+      notify_changes: false,
       sync_pending: false,
       last_sync_at: nil,
       # Local replica of this topic's Presence entries, kept current by applying
@@ -144,6 +145,10 @@ defmodule LiveCollab.LiveView do
 
     * `:client_id` - override the generated client id (useful in tests). It is
       server-side only; the browser can never choose it.
+    * `:notify_changes` - when `true`, changes announced by other collaborators
+      with `broadcast_changes/3` are also delivered to your LiveView as
+      `{:live_collab, :remote_changes, %{changes: map, by: map}}` so you can
+      reload your data (default `false`).
 
   Raises `ArgumentError` when no Presence module is configured or when the
   configuration is invalid.
@@ -202,6 +207,7 @@ defmodule LiveCollab.LiveView do
     |> assign(:collab_editing_field, nil)
     |> assign(:collab_active_element, nil)
     |> assign(:collab_spotlight_leader, nil)
+    |> assign_coordination_defaults()
   end
 
   @doc """
@@ -245,6 +251,7 @@ defmodule LiveCollab.LiveView do
       %Session{} = session ->
         clients = client_ids(entries)
         {socket, session} = notify_departures(socket, session, clients)
+        socket = prune_handoffs(socket, locks, clients, session.client_id)
 
         Telemetry.execute(
           [:presence, :sync],
@@ -331,6 +338,7 @@ defmodule LiveCollab.LiveView do
       |> assign(:collab_editing_field, nil)
       |> assign(:collab_active_element, nil)
       |> assign(:collab_spotlight_leader, nil)
+      |> assign_coordination_defaults()
 
     if connected?(socket) do
       pubsub = Config.pubsub_server!(config)
@@ -354,6 +362,7 @@ defmodule LiveCollab.LiveView do
         identity: identity,
         user: user,
         config: config,
+        notify_changes: Keyword.get(opts, :notify_changes, false) == true,
         telemetry_limiter:
           RateLimiter.new(
             rate: config.telemetry_rate_per_sec,
@@ -424,7 +433,10 @@ defmodule LiveCollab.LiveView do
         )
 
         Telemetry.execute([:lock, :released], %{}, Map.put(meta(session), :field, current))
-        assign(socket, :collab_editing_field, nil)
+
+        socket
+        |> assign(:collab_editing_field, nil)
+        |> update_map_assign(:collab_lock_requests, &Map.delete(&1, current))
 
       :ignore ->
         socket
@@ -670,15 +682,87 @@ defmodule LiveCollab.LiveView do
     end
   end
 
+  # --- Lock handoff ("ask to edit") ----------------------------------------------
+
+  defp handle_client_event("lock_request", %{"field" => raw}, socket, session) do
+    rate_limited(socket, session, :telemetry, "lock_request", fn socket, session ->
+      with {:ok, field} <- Field.validate_field_id(raw, session.config.max_field_id_length),
+           %{client_id: holder} when holder != session.client_id <-
+             Map.get(socket.assigns.collab_locks, field) do
+        send_lock_request(socket, session, field, holder)
+      else
+        {:error, reason} -> reject(socket, session, "lock_request", reason)
+        _not_held_by_other -> reject(socket, session, "lock_request", :not_locked_by_other)
+      end
+    end)
+  end
+
+  defp handle_client_event(
+         "lock_handoff",
+         %{"field" => field, "to" => to} = params,
+         socket,
+         session
+       )
+       when is_binary(field) and is_binary(to) do
+    requests = Map.get(socket.assigns.collab_lock_requests, field, [])
+
+    if Enum.any?(requests, &(&1.client_id == to)) do
+      respond_to_request(socket, session, field, to, params["accept"] in [true, "true"])
+    else
+      # Only requests this LiveView actually received can be answered.
+      reject(socket, session, "lock_handoff", :no_such_request)
+    end
+  end
+
+  # --- Conflict-aware forms ----------------------------------------------------
+
+  defp handle_client_event("dismiss_change", %{"field" => field}, socket, session)
+       when is_binary(field) do
+    if Map.has_key?(socket.assigns.collab_remote_changes, field) do
+      socket
+      |> update_map_assign(:collab_remote_changes, &Map.delete(&1, field))
+      |> push_event("live_collab:change_dismissed", %{field: field})
+    else
+      reject(socket, session, "dismiss_change", :no_such_change)
+    end
+  end
+
   # Known event with missing/ill-typed params, or an unknown live_collab:* event.
   defp handle_client_event(event, _params, socket, session) do
     reason = if event in known_events(), do: :invalid_params, else: :unknown_event
     reject(socket, session, event, reason)
   end
 
+  defp send_lock_request(socket, session, field, holder) do
+    if socket.assigns.collab_lock_asks[field] == :pending do
+      socket
+    else
+      broadcast(
+        session,
+        {:collab_lock_request, session.topic,
+         %{
+           field: field,
+           to_client_id: holder,
+           from_client_id: session.client_id,
+           from_name: session.identity.name,
+           from_color: session.identity.color
+         }}
+      )
+
+      Telemetry.execute(
+        [:lock, :requested],
+        %{},
+        meta(session) |> Map.put(:field, field) |> Map.put(:holder_client_id, holder)
+      )
+
+      update_map_assign(socket, :collab_lock_asks, &Map.put(&1, field, :pending))
+    end
+  end
+
   defp known_events do
     ~w(field_focus field_blur element_active element_inactive cursor_move cursor_left
-       viewport_move selection_move selection_clear spotlight_lead spotlight_stop status)
+       viewport_move selection_move selection_clear spotlight_lead spotlight_stop status
+       lock_request lock_handoff dismiss_change)
   end
 
   defp parse_status("active"), do: {:ok, :active}
@@ -757,6 +841,20 @@ defmodule LiveCollab.LiveView do
     end
   end
 
+  def __handle_info__({kind, topic, payload}, socket)
+      when kind in [:collab_lock_request, :collab_lock_response, :collab_field_changes] do
+    case session(socket) do
+      %Session{topic: ^topic} = session when is_map(payload) ->
+        {:halt, coordinate(kind, payload, socket, session)}
+
+      %Session{topic: ^topic} ->
+        {:halt, socket}
+
+      _ ->
+        absorb_if_owned(socket, topic)
+    end
+  end
+
   def __handle_info__(_msg, socket), do: {:cont, socket}
 
   # A message for a topic this process tracked earlier (before untrack/2 or a
@@ -793,6 +891,323 @@ defmodule LiveCollab.LiveView do
   defp client_event_name(:collab_viewport_moved), do: "live_collab:viewport_moved"
   defp client_event_name(:collab_selection_moved), do: "live_collab:selection_moved"
   defp client_event_name(:collab_selection_cleared), do: "live_collab:selection_cleared"
+
+  # ============================================================================
+  # Lock handoff and conflict-aware forms
+  # ============================================================================
+
+  @max_changes 100
+  @max_change_value_bytes 65_536
+
+  @doc """
+  Tells every other collaborator on this socket's topic that fields were saved.
+
+  Call it after your own code has persisted the change. LiveCollab does not
+  store data; it only notifies the other open LiveViews:
+
+    * a collaborator who is **editing** one of the fields (holds its lock) gets a
+      conflict entry in `@collab_remote_changes` (render it with
+      `LiveCollab.Components.field_change_notice/1`) and a
+      `live_collab:field_conflict` push event;
+    * everyone else gets a `live_collab:field_changed` push event, which the
+      `LiveCollabField` hook uses to update and highlight the input;
+    * LiveViews tracked with `notify_changes: true` also receive
+      `{:live_collab, :remote_changes, %{changes: changes, by: by}}` so they can
+      reload their data.
+
+  `changes` is a map (or keyword list) of field id => value. Values must be
+  `nil`, booleans, numbers or strings of at most 64 KB; at most #{@max_changes}
+  fields per call. Invalid input raises `ArgumentError`. On a socket that is not
+  connected or not tracked this is a no-op.
+
+      def handle_event("save", %{"order" => params}, socket) do
+        {:ok, order} = Orders.update(socket.assigns.order, params)
+
+        {:noreply,
+         socket
+         |> assign(:order, order)
+         |> LiveCollab.broadcast_changes(%{"order.name" => order.name})}
+      end
+  """
+  @spec broadcast_changes(Phoenix.LiveView.Socket.t(), map() | keyword(), keyword()) ::
+          Phoenix.LiveView.Socket.t()
+  def broadcast_changes(socket, changes, _opts \\ []) do
+    changes = validate_changes!(changes, socket)
+
+    case session(socket) do
+      %Session{} = session when map_size(changes) > 0 ->
+        broadcast(
+          session,
+          {:collab_field_changes, session.topic,
+           %{
+             changes: changes,
+             by: %{
+               client_id: session.client_id,
+               user_id: session.identity.id,
+               name: session.identity.name,
+               color: session.identity.color
+             },
+             at: System.system_time(:millisecond)
+           }}
+        )
+
+        Telemetry.execute(
+          [:field, :changes_broadcast],
+          %{count: map_size(changes)},
+          Map.put(meta(session), :fields, Map.keys(changes))
+        )
+
+        socket
+
+      _ ->
+        socket
+    end
+  end
+
+  defp validate_changes!(changes, socket) when is_map(changes) or is_list(changes) do
+    max_len =
+      case socket.assigns[:collab_config] do
+        %Config{max_field_id_length: len} -> len
+        _ -> 255
+      end
+
+    pairs = Enum.to_list(changes)
+
+    if length(pairs) > @max_changes do
+      raise ArgumentError, "broadcast_changes/3 accepts at most #{@max_changes} fields per call"
+    end
+
+    Map.new(pairs, fn {field, value} ->
+      field = to_string(field)
+
+      case Field.validate_field_id(field, max_len) do
+        {:ok, field} -> {field, validate_change_value!(field, value)}
+        {:error, reason} -> raise ArgumentError, "invalid field id #{inspect(field)}: #{reason}"
+      end
+    end)
+  end
+
+  defp validate_changes!(other, _socket) do
+    raise ArgumentError, "expected changes to be a map or keyword list, got: #{inspect(other)}"
+  end
+
+  defp validate_change_value!(_field, value)
+       when is_nil(value) or is_boolean(value) or is_number(value),
+       do: value
+
+  defp validate_change_value!(field, value) when is_binary(value) do
+    if byte_size(value) <= @max_change_value_bytes and String.valid?(value) do
+      value
+    else
+      raise ArgumentError,
+            "value for #{inspect(field)} must be valid UTF-8 of at most #{@max_change_value_bytes} bytes"
+    end
+  end
+
+  defp validate_change_value!(field, value) do
+    raise ArgumentError,
+          "value for #{inspect(field)} must be nil, a boolean, a number or a string, got: #{inspect(value)}"
+  end
+
+  defp assign_coordination_defaults(socket) do
+    socket
+    |> assign(:collab_lock_requests, %{})
+    |> assign(:collab_lock_asks, %{})
+    |> assign(:collab_remote_changes, %{})
+  end
+
+  defp update_map_assign(socket, key, fun),
+    do: assign(socket, key, fun.(socket.assigns[key] || %{}))
+
+  # A request reaches every LiveView on the topic; only the addressed holder,
+  # and only while it still holds that field, keeps it.
+  defp coordinate(
+         :collab_lock_request,
+         %{field: field, to_client_id: to, from_client_id: from} = payload,
+         socket,
+         session
+       )
+       when is_binary(field) and is_binary(from) do
+    if to == session.client_id and socket.assigns.collab_editing_field == field do
+      request = %{
+        client_id: from,
+        user_name: to_string(payload[:from_name] || "Someone"),
+        user_color: Presence.safe_color(payload[:from_color], from)
+      }
+
+      socket
+      |> update_map_assign(:collab_lock_requests, fn requests ->
+        existing = Map.get(requests, field, []) |> Enum.reject(&(&1.client_id == from))
+        Map.put(requests, field, Enum.take(existing ++ [request], 5))
+      end)
+      |> push_event("live_collab:lock_requested", %{
+        field: field,
+        requested_by: request.user_name,
+        client_id: from
+      })
+    else
+      socket
+    end
+  end
+
+  defp coordinate(
+         :collab_lock_response,
+         %{field: field, to_client_id: to} = payload,
+         socket,
+         session
+       )
+       when is_binary(field) do
+    cond do
+      to != session.client_id ->
+        socket
+
+      payload[:accepted] == true ->
+        # The holder released the lock before answering, but this LiveView's
+        # throttled rebuild may not have seen that yet. Drop the stale lock now,
+        # so the claim the hook is about to make is not refused.
+        from = payload[:from_client_id]
+
+        socket
+        |> update_map_assign(:collab_lock_asks, &Map.delete(&1, field))
+        |> update_map_assign(:collab_locks, &drop_lock_held_by(&1, field, from))
+        |> push_event("live_collab:lock_granted", %{field: field, granted_by: payload[:from_name]})
+
+      true ->
+        update_map_assign(socket, :collab_lock_asks, &Map.put(&1, field, :declined))
+    end
+  end
+
+  defp coordinate(:collab_field_changes, %{changes: changes, by: by} = payload, socket, session)
+       when is_map(changes) and is_map(by) do
+    editing = socket.assigns.collab_editing_field
+    by_name = to_string(by[:name] || "Someone")
+    by_color = Presence.safe_color(by[:color], by[:client_id])
+
+    by_info = %{name: by_name, color: by_color, client_id: by[:client_id], at: payload[:at]}
+
+    socket =
+      Enum.reduce(changes, socket, fn {field, value}, socket ->
+        apply_remote_change(socket, session, field, value, field == editing, by_info)
+      end)
+
+    if session.notify_changes do
+      send(self(), {:live_collab, :remote_changes, %{changes: changes, by: by}})
+    end
+
+    socket
+  end
+
+  defp coordinate(_kind, _payload, socket, _session), do: socket
+
+  # Someone saved `field`. If this client is editing it, record a conflict for
+  # <.field_change_notice>; otherwise let the hook update the input.
+  defp apply_remote_change(socket, session, field, value, editing?, by) do
+    event = %{field: field, value: value, by: by.name, by_color: by.color}
+
+    if editing? do
+      Telemetry.execute(
+        [:field, :conflict],
+        %{},
+        meta(session) |> Map.put(:field, field) |> Map.put(:by_client_id, by.client_id)
+      )
+
+      change = %{
+        value: value,
+        by_name: by.name,
+        by_color: by.color,
+        by_client_id: by.client_id,
+        at: by.at
+      }
+
+      socket
+      |> update_map_assign(:collab_remote_changes, &Map.put(&1, field, change))
+      |> push_event("live_collab:field_conflict", event)
+    else
+      push_event(socket, "live_collab:field_changed", event)
+    end
+  end
+
+  defp respond_to_request(socket, session, field, to, accept?) do
+    socket =
+      if accept? and socket.assigns.collab_editing_field == field do
+        Presence.clear_field(
+          session.presence,
+          self(),
+          session.topic,
+          session.user_key,
+          session.client_id
+        )
+
+        Telemetry.execute([:lock, :released], %{}, Map.put(meta(session), :field, field))
+        assign(socket, :collab_editing_field, nil)
+      else
+        socket
+      end
+
+    broadcast(
+      session,
+      {:collab_lock_response, session.topic,
+       %{
+         field: field,
+         to_client_id: to,
+         accepted: accept?,
+         from_client_id: session.client_id,
+         from_name: session.identity.name
+       }}
+    )
+
+    event = if accept?, do: :handed_off, else: :handoff_declined
+
+    Telemetry.execute(
+      [:lock, event],
+      %{},
+      meta(session) |> Map.put(:field, field) |> Map.put(:requester_client_id, to)
+    )
+
+    update_map_assign(socket, :collab_lock_requests, &drop_requests(&1, field, to, accept?))
+  end
+
+  defp drop_lock_held_by(locks, field, holder) do
+    case locks do
+      %{^field => %{client_id: ^holder}} -> Map.delete(locks, field)
+      _ -> locks
+    end
+  end
+
+  # A handover answers every request for the field; a decline only the one.
+  defp drop_requests(requests, field, _to, true), do: Map.delete(requests, field)
+
+  defp drop_requests(requests, field, to, false) do
+    case requests |> Map.get(field, []) |> Enum.reject(&(&1.client_id == to)) do
+      [] -> Map.delete(requests, field)
+      remaining -> Map.put(requests, field, remaining)
+    end
+  end
+
+  # Drops handoff state that no longer applies: requests for fields this client
+  # no longer holds or from collaborators who left, and asks for fields that are
+  # no longer held by someone else.
+  defp prune_handoffs(socket, locks, clients, own_client_id) do
+    editing = socket.assigns[:collab_editing_field]
+
+    requests =
+      for {field, reqs} <- socket.assigns[:collab_lock_requests] || %{},
+          field == editing,
+          reqs = Enum.filter(reqs, &MapSet.member?(clients, &1.client_id)),
+          reqs != [],
+          into: %{},
+          do: {field, reqs}
+
+    asks =
+      for {field, state} <- socket.assigns[:collab_lock_asks] || %{},
+          match?(%{client_id: holder} when holder != own_client_id, locks[field]),
+          into: %{},
+          do: {field, state}
+
+    socket
+    |> assign(:collab_lock_requests, requests)
+    |> assign(:collab_lock_asks, asks)
+  end
 
   # ============================================================================
   # Helpers

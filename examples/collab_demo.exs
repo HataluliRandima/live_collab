@@ -6,7 +6,11 @@
 # in two windows and try each section:
 #
 #   * Avatars dim when someone switches tabs or is idle for 15 seconds.
-#   * Field locks: focus the same input in both windows.
+#   * Field locks: focus the same input in both windows. The other person can
+#     press "Ask to edit"; the holder gets "Hand over" / "Keep editing".
+#   * Conflicts: Alice types in Summary, clicks elsewhere, Bob starts editing
+#     Summary, then Alice presses Save. Bob sees "Alice saved … while you were
+#     editing" with "Use theirs" / "Keep mine". Fields nobody is editing just update.
 #   * Rows: click a task (or hover for a moment) to show who is looking at it.
 #   * Presenter: press "Present" and scroll the document; the other window follows.
 #     Open ?name=Eve&role=viewer to see an unauthorized attempt rejected.
@@ -48,6 +52,15 @@ Mix.install(
 
 defmodule Demo.Presence do
   use Phoenix.Presence, otp_app: :live_collab, pubsub_server: Demo.PubSub
+end
+
+defmodule Demo.Doc do
+  @moduledoc "The demo's \"database\": one shared document held in an Agent."
+  use Agent
+
+  def start_link(_), do: Agent.start_link(fn -> %{"title" => "Q3 planning", "summary" => ""} end, name: __MODULE__)
+  def get, do: Agent.get(__MODULE__, & &1)
+  def put(changes), do: Agent.update(__MODULE__, &Map.merge(&1, changes))
 end
 
 defmodule Demo.Diagnostics do
@@ -113,6 +126,15 @@ defmodule Demo.Layout do
           .diag { width: 100%; border-collapse: collapse; font: 12px ui-monospace, monospace; }
           .diag td { padding: 2px 4px; border-bottom: 1px solid #f3f4f6; vertical-align: top; }
           .hint { color: #6b7280; font-size: 12px; margin: 4px 0 8px; }
+          /* handoff + conflicts */
+          .field { margin-bottom: 10px; }
+          .live-collab-field-indicator button { margin-left: 6px; padding: 0 6px; font-size: 11px; border: 0;
+            border-radius: 4px; background: rgba(255,255,255,.25); color: #fff; cursor: pointer; }
+          .notice { display: inline-flex; gap: 8px; align-items: center; margin: 4px 0; padding: 4px 8px;
+            border-radius: 6px; background: #fff7ed; border: 1px solid #fdba74; font-size: 12px; }
+          .notice span:first-child { width: 8px; height: 8px; border-radius: 999px; display: inline-block; }
+          .collab-remote-updated { background: #fef9c3; transition: background .3s; }
+          .collab-conflict { border-color: #f97316 !important; box-shadow: 0 0 0 2px #fed7aa; }
           /* away status */
           .live-collab-away { opacity: .35; filter: grayscale(1); }
           /* row activity */
@@ -231,12 +253,51 @@ defmodule Demo.CollabLive do
       socket
       |> assign(:diagnostics, [])
       |> assign(:tasks, [{1, "Write release notes"}, {2, "Review pull request"}, {3, "Fix flaky test"}])
-      |> LiveCollab.track("demo:document", user)
+      |> assign(:doc, Demo.Doc.get())
+      |> assign(:draft, Demo.Doc.get())
+      |> assign(:saved_at, nil)
+      # notify_changes: reload Demo.Doc when someone else saves.
+      |> LiveCollab.track("demo:document", user, notify_changes: true)
 
     {:ok, socket}
   end
 
+  @fields ["title", "summary"]
+
   @impl true
+  def handle_event("validate", %{"doc" => params}, socket) do
+    {:noreply, update(socket, :draft, &Map.merge(&1, Map.take(params, @fields)))}
+  end
+
+  # A naive save: persist every field whose value differs from the stored one,
+  # then announce it. (A real app would also use LiveCollab.validate_not_locked/5.)
+  def handle_event("save", %{"doc" => params}, socket) do
+    stored = Demo.Doc.get()
+    changes = for {field, value} <- Map.take(params, @fields), value != stored[field], into: %{}, do: {field, value}
+    Demo.Doc.put(changes)
+
+    {:noreply,
+     socket
+     |> assign(:doc, Demo.Doc.get())
+     |> update(:draft, &Map.merge(&1, changes))
+     |> assign(:saved_at, Time.utc_now() |> Time.truncate(:second))
+     |> LiveCollab.broadcast_changes(changes)}
+  end
+
+  # Someone else saved: reload, but keep whatever is being typed in the field
+  # this client is editing (that case gets a conflict notice instead).
+  @impl true
+  def handle_info({:live_collab, :remote_changes, %{changes: changes}}, socket) do
+    doc = Demo.Doc.get()
+    editing = socket.assigns.collab_editing_field
+    taken = changes |> Map.keys() |> Enum.reject(&(&1 == editing))
+
+    {:noreply,
+     socket
+     |> assign(:doc, doc)
+     |> update(:draft, &Map.merge(&1, Map.take(doc, taken)))}
+  end
+
   def handle_info({:diagnostic, entry}, socket) do
     {:noreply, update(socket, :diagnostics, &Enum.take([entry | &1], 25))}
   end
@@ -262,15 +323,32 @@ defmodule Demo.CollabLive do
         <.avatar_stack users={@collab_users} max={6} />
         <p class="hint">Avatars dim when that person switches tabs or is idle for 15 s.</p>
 
-        <h3>Advisory field locks</h3>
-        <p :for={field <- ["title", "summary"]}>
-          <input
-            type="text"
-            placeholder={field}
-            {collab_attrs(field, @collab_locks, @collab_client_id)}
-          />
-          <.field_indicator field={field} locks={@collab_locks} current_client_id={@collab_client_id} />
+        <h3>Advisory field locks, handoff and conflicts</h3>
+        <p class="hint">
+          Focus a field to lock it; others can press "Ask to edit". Save stores the document and
+          updates everyone else's form.
         </p>
+        <.lock_requests requests={@collab_lock_requests} class="notice" />
+        <form phx-change="validate" phx-submit="save">
+          <div :for={field <- ["title", "summary"]} class="field">
+            <input
+              type="text"
+              name={"doc[#{field}]"}
+              value={@draft[field]}
+              placeholder={field}
+              {collab_attrs(field, @collab_locks, @collab_client_id)}
+            />
+            <.field_indicator
+              field={field}
+              locks={@collab_locks}
+              current_client_id={@collab_client_id}
+              asks={@collab_lock_asks}
+            />
+            <div><.field_change_notice field={field} changes={@collab_remote_changes} class="notice" /></div>
+          </div>
+          <button type="submit">Save</button>
+          <span :if={@saved_at} class="hint">Saved at {@saved_at} UTC</span>
+        </form>
 
         <h3>Row activity</h3>
         <p class="hint">Click a task, or hover for 0.4 s, to show the others who is looking at it.</p>
@@ -391,7 +469,7 @@ LiveCollab.Telemetry.attach_default_logger()
 
 {:ok, _} =
   Supervisor.start_link(
-    [{Phoenix.PubSub, name: Demo.PubSub}, Demo.Presence, Demo.Endpoint],
+    [{Phoenix.PubSub, name: Demo.PubSub}, Demo.Presence, Demo.Doc, Demo.Endpoint],
     strategy: :one_for_one
   )
 

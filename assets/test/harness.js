@@ -11,6 +11,8 @@ export function setupDom() {
   globalThis.window = window;
   globalThis.document = window.document;
   globalThis.CustomEvent = window.CustomEvent;
+  // Hooks construct plain Events too (e.g. "input"); they must be jsdom's.
+  globalThis.Event = window.Event;
   globalThis.HTMLElement = window.HTMLElement;
   // Manually driven animation frames, so tests can step the render loop.
   globalThis.requestAnimationFrame = (cb) => frames.push(cb);

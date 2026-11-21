@@ -24,6 +24,8 @@ works across a clustered deployment.
 | Presence and avatar stack (multi-tab aware) | Presence | `@collab_users`, `<.avatar_stack>` | none |
 | Away / idle status | Presence | `<.status_reporter>`, `status` in `@collab_users` | `LiveCollabStatus` |
 | Advisory field locks with tie-breaking | Presence | `@collab_locks`, `collab_attrs/4`, `<.field_indicator>`, `validate_not_locked/5` | `LiveCollabField` |
+| "Ask to edit" lock handoff | PubSub | `@collab_lock_asks`, `@collab_lock_requests`, `<.field_indicator asks=…>`, `<.lock_requests>` | `LiveCollabField` |
+| Conflict-aware forms | PubSub | `broadcast_changes/3`, `@collab_remote_changes`, `<.field_change_notice>` | `LiveCollabField` |
 | Row and element activity (viewing / selected / editing) | Presence | `@collab_activities`, `collab_row_attrs/4`, `<.row_indicator>`, `<.element_activity>` | `LiveCollabElement` |
 | Live cursors | PubSub | `<.cursor_layer>` | `LiveCollabCursor` |
 | Presenter mode and scroll following | PubSub | `<.viewport_container>`, `<.follow_pill>` | `LiveCollabViewport` |
@@ -150,6 +152,48 @@ def handle_event("save", %{"order" => params}, socket) do
   # ...
 end
 ```
+
+### "Ask to edit"
+
+```heex
+<.lock_requests requests={@collab_lock_requests} />
+
+<input type="text" name="order[name]" {collab_attrs("order.name", @collab_locks, @collab_client_id)} />
+<.field_indicator field="order.name" locks={@collab_locks} current_client_id={@collab_client_id} asks={@collab_lock_asks} />
+```
+
+When someone else holds the field, the indicator shows **Ask to edit**. The
+holder sees "Bob wants to edit order.name — **Hand over** / **Keep editing**".
+Handing over releases the holder's lock and focuses the requester's input,
+which claims it. A handoff can only answer a request that was actually received,
+and requests are dropped when either person leaves or the lock changes hands.
+
+### Conflict-aware forms
+
+After saving, announce the new values:
+
+```elixir
+def handle_event("save", %{"order" => params}, socket) do
+  {:ok, order} = Orders.update(socket.assigns.order, params)
+
+  {:noreply,
+   socket
+   |> assign(:order, order)
+   |> LiveCollab.broadcast_changes(%{"order.name" => order.name})}
+end
+```
+
+In every other open form:
+
+* inputs nobody is editing update and briefly highlight (`collab-remote-updated`);
+* if the receiver is editing that field, their text is left alone and
+  `<.field_change_notice field="order.name" changes={@collab_remote_changes} />`
+  shows "Alice saved “Acme” while you were editing — **Use theirs** / **Keep mine**".
+
+Track with `notify_changes: true` to receive
+`{:live_collab, :remote_changes, %{changes: changes, by: by}}` in `handle_info/2`
+and reload your data, so the new values survive later re-renders. LiveCollab
+never stores data; it only tells the other LiveViews what you saved.
 
 ### Row and element activity
 

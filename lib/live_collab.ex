@@ -110,6 +110,12 @@ defmodule LiveCollab do
   defdelegate untrack(socket, opts \\ []), to: LV
 
   @doc """
+  Announces saved field values to the other collaborators. See
+  `LiveCollab.LiveView.broadcast_changes/3`.
+  """
+  defdelegate broadcast_changes(socket, changes, opts \\ []), to: LV
+
+  @doc """
   Checks if a field is currently locked.
   Accepts either a LiveView socket (with `@collab_locks` assigned) or directly a locks map.
   """

@@ -529,3 +529,77 @@ describe("overlay layers survive LiveView patches", () => {
   });
 });
 
+describe("LiveCollabField: handoff and remote changes", () => {
+  const input = (attrs = {}) =>
+    element("input", { "data-collab-field": "title", "data-collab-locked": "false", value: "old", ...attrs });
+
+  test("lock_granted unlocks and focuses the input, which claims the field", () => {
+    const el = input({ "data-collab-locked": "true" });
+    const h = mountHook(LiveCollabField, el);
+    assert.equal(el.getAttribute("readonly"), "readonly");
+
+    h.server("live_collab:lock_granted", { field: "title", granted_by: "Alice" });
+
+    assert.equal(document.activeElement, el);
+    assert.equal(el.hasAttribute("readonly"), false);
+    assert.deepEqual(h.events("live_collab:field_focus"), [
+      { event: "live_collab:field_focus", payload: { field: "title" } }
+    ]);
+  });
+
+  test("a saved change updates an input you are not editing, with a temporary highlight", (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const el = input();
+    const h = mountHook(LiveCollabField, el);
+    const seen = [];
+    document.body.addEventListener("live_collab:remote_change", (e) => seen.push(e.detail));
+
+    h.server("live_collab:field_changed", { field: "title", value: "Alice's title", by: "Alice" });
+
+    assert.equal(el.value, "Alice's title");
+    assert.ok(el.classList.contains("collab-remote-updated"));
+    t.mock.timers.tick(2000);
+    assert.ok(!el.classList.contains("collab-remote-updated"));
+    assert.deepEqual(seen, [{ field: "title", value: "Alice's title", by: "Alice", applied: true }]);
+  });
+
+  test("never overwrites text the user is typing; flags a conflict instead", () => {
+    const el = input();
+    const h = mountHook(LiveCollabField, el);
+    el.focus();
+    el.value = "my unsaved text";
+
+    h.server("live_collab:field_changed", { field: "title", value: "theirs", by: "Alice" });
+    h.server("live_collab:field_conflict", { field: "title", value: "theirs", by: "Alice" });
+
+    assert.equal(el.value, "my unsaved text");
+    assert.ok(el.classList.contains("collab-conflict"));
+
+    h.server("live_collab:change_dismissed", { field: "title" });
+    assert.ok(!el.classList.contains("collab-conflict"));
+  });
+
+  test("'Use theirs' (apply_remote) sets the value and fires input for phx-change", () => {
+    const el = input();
+    mountHook(LiveCollabField, el);
+    el.classList.add("collab-conflict");
+    const inputs = [];
+    el.addEventListener("input", () => inputs.push(el.value));
+
+    el.dispatchEvent(new CustomEvent("live_collab:apply_remote", { detail: { value: "theirs" } }));
+
+    assert.equal(el.value, "theirs");
+    assert.deepEqual(inputs, ["theirs"]);
+    assert.ok(!el.classList.contains("collab-conflict"));
+  });
+
+  test("changes for other fields are ignored", () => {
+    const el = input();
+    const h = mountHook(LiveCollabField, el);
+    h.server("live_collab:field_changed", { field: "other", value: "x" });
+    h.server("live_collab:lock_granted", { field: "other" });
+    assert.equal(el.value, "old");
+    assert.equal(h.events("live_collab:field_focus").length, 0);
+  });
+});
+

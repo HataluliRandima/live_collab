@@ -53,12 +53,21 @@ defmodule LiveCollab.Test.CollabLive do
     {:noreply, LiveCollab.untrack(socket)}
   end
 
+  # Simulates an app that persisted values and announces them to collaborators.
+  def handle_event("save", %{"changes" => changes}, socket) do
+    {:noreply, LiveCollab.broadcast_changes(socket, changes)}
+  end
+
   # Application events must keep flowing through LiveCollab's hooks untouched.
   def handle_event("app_event", params, socket) do
     {:noreply, update(socket, :app_events, &[params | &1])}
   end
 
   @impl true
+  def handle_info({:live_collab, :remote_changes, info}, socket) do
+    {:noreply, update(socket, :app_events, &[{:remote_changes, info} | &1])}
+  end
+
   def handle_info({:app_message, msg}, socket) do
     {:noreply, update(socket, :app_events, &[{:info, msg} | &1])}
   end
